@@ -546,13 +546,18 @@ function processVideo(){
       const hasReflection = reflectionData.hasReflection;
       const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection;
 
-      const contourVec = new cv.MatVector();
-      contourVec.push_back(bestLocalContour);
+      // REMOVE OR COMMENT OUT THESE LINES (lines 405-410)
+      // const contourVec = new cv.MatVector();
+      // contourVec.push_back(bestLocalContour);
+      // const color = isGood ? new cv.Scalar(0,255,0,255) : 
+      //               inFrame ? new cv.Scalar(0,165,255,255) : 
+      //               new cv.Scalar(255,0,0,255);
+      // cv.drawContours(display, contourVec, 0, color, 2);
+      // contourVec.delete();
+
       const color = isGood ? new cv.Scalar(0,255,0,255) : 
                     inFrame ? new cv.Scalar(0,165,255,255) : 
                     new cv.Scalar(255,0,0,255);
-      cv.drawContours(display, contourVec, 0, color, 2);
-      contourVec.delete();
 
       cv.putText(display, `Score: ${score.toFixed(2)}`, new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.9, color,2);
       cv.putText(display, `Sharp: ${sharpness.toFixed(1)}`, new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(isSharp?0:255, isSharp?255:0, 0,255),2);
@@ -602,7 +607,7 @@ function processVideo(){
           
           if (capturedFrame) capturedFrame.delete();
           capturedFrame = bestFrameData.frame.clone();
-          
+
           if (bestContour) bestContour.delete();
           bestContour = bestFrameData.contour.clone();
           
@@ -622,10 +627,11 @@ function processVideo(){
           stopCamera();
           
           const displayFrame = capturedFrame.clone();
-          const contourVec2 = new cv.MatVector();
-          contourVec2.push_back(bestContour);
-          cv.drawContours(displayFrame, contourVec2, 0, new cv.Scalar(0,255,0,255), 2);
-          contourVec2.delete();
+          // REMOVE OR COMMENT OUT THESE LINES (lines 461-465)
+          // const contourVec2 = new cv.MatVector();
+          // contourVec2.push_back(bestContour);
+          // cv.drawContours(displayFrame, contourVec2, 0, new cv.Scalar(0,255,0,255), 2);
+          // contourVec2.delete();
           
           cv.putText(displayFrame, "Card Detected! Click 'Crop Card' to extract", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,0,255),2);
           cv.imshow(canvasOutput, displayFrame);
@@ -715,12 +721,23 @@ saveBtn.addEventListener('click', ()=>{
   cv.imshow(canvasOutput, bestCropped);
   logStatus("Card cropped and sharpened! Downloading...");
   
-  // Auto-download
+  // Auto-download - Create a temporary canvas for clean output
   setTimeout(() => {
+    // Create a temporary canvas to ensure clean output
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = bestCropped.cols;
+    tempCanvas.height = bestCropped.rows;
+    const tempCtx = tempCanvas.getContext('2d');
+    
+    // Draw the clean cropped image to temp canvas
+    cv.imshow(tempCanvas, bestCropped);
+    
+    // Download from temp canvas
     const link = document.createElement('a');
     link.download = 'cropped_card.png';
-    link.href = canvasOutput.toDataURL('image/png', 1.0); // คุณภาพสูงสุด
+    link.href = tempCanvas.toDataURL('image/png', 1.0); // คุณภาพสูงสุด
     link.click();
+    
     logStatus("Card saved! Click 'Start Camera' to capture another card.");
   }, 100);
 });                                                                              

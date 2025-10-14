@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Card Detection (OpenCV.js / WASM)</title>
+  <!-- โหลด opencv.js (ใช้ CDN หรือไฟล์ที่ดาวน์โหลดมา) -->
+  <script src="https://docs.opencv.org/4.x/opencv.js" type="text/javascript"></script>
+  <style>
+    body { font-family: Arial, sans-serif; display:flex; gap:16px; padding:12px; }
+    #video, #canvasOutput { max-height:480px; border:1px solid #ccc; }
+    #controls { display:flex; flex-direction:column; gap:8px; }
+  </style>
+</head>
+<body>
+  <div>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvasOutput"></canvas>
+  </div>
+  <div id="controls">
+    <div id="status">Loading OpenCV...</div>
+    <button id="toggleCameraBtn">Start Camera</button>
+    <button id="saveBtn">Crop Card</button>
+    <label><input id="toggleBlurWarn" type="checkbox" checked> Show blur/tilt hints</label>
+  </div>
+
+  <script type="text/javascript" src="script.js"></script>
+</body>
+</html>

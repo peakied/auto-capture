@@ -15,13 +15,13 @@ let cameraStream = null;
 let isProcessing = false;
 let capturedFrame = null; // Store the captured frame
 
-const scoreThreshold = 0.65;
-const sharpnessThreshold = 40;
-const requiredStableFrames = 10;
-const inFrameThreshold = 0.7; // 70% ของบัตรต้องอยู่ในกรอบ
+const scoreThreshold = 0.60; // Slightly lower threshold
+const sharpnessThreshold = 35; // Slightly lower for more flexibility
+const requiredStableFrames = 15; // Increase to get more samples
+const inFrameThreshold = 0.7;
 let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
-const historySize = 5;
+const historySize = 10; // Increase history size to capture more frames
 
 function logStatus(s){ statusEl.innerText = s; }
 
@@ -291,17 +291,21 @@ function isCardInFrame(cardContour, frameBox) {
 function calculateCardScore(contour, frameShape){
   const frameArea = frameShape.height * frameShape.width;
   const cardArea = cv.contourArea(contour);
-  // bounding rect
   const rect = cv.boundingRect(contour);
   const x = rect.x, y = rect.y, w = rect.width, h = rect.height;
   const areaRatio = cardArea / frameArea;
   
-  let areaScore = 1.0;
-  if (0.10 < areaRatio && areaRatio < 0.7) {
-    // ให้คะแนนดีถ้าอยู่ในช่วง 10-70% ของเฟรม
-    areaScore = Math.min(areaRatio / 0.25, 1.0);
+  // Improved area scoring - prefer 15-50% of frame
+  let areaScore = 0;
+  if (areaRatio >= 0.15 && areaRatio <= 0.50) {
+    // Optimal range
+    areaScore = 1.0;
+  } else if (areaRatio < 0.15) {
+    // Too small
+    areaScore = areaRatio / 0.15;
   } else {
-    areaScore = areaRatio / 0.4;
+    // Too large
+    areaScore = Math.max(0, 1.0 - (areaRatio - 0.50) / 0.30);
   }
 
   const frame_cx = frameShape.width / 2.0, frame_cy = frameShape.height / 2.0;
@@ -317,7 +321,17 @@ function calculateCardScore(contour, frameShape){
 
   hull.delete();
 
-  return (areaScore * 0.3 + centerScore * 0.3 + straightnessScore * 0.4);
+  // Adjusted weights - prioritize straightness and centering
+  return (areaScore * 0.25 + centerScore * 0.35 + straightnessScore * 0.40);
+}
+
+// New function to calculate combined quality score
+function calculateQualityScore(score, sharpness, reflectionRatio) {
+  const normalizedSharpness = Math.min(sharpness / 100.0, 1.0);
+  const reflectionPenalty = Math.max(0, 1.0 - (reflectionRatio * 2)); // Penalize reflection
+  
+  // Combined quality: 40% positioning, 50% sharpness, 10% reflection penalty
+  return (score * 0.40) + (normalizedSharpness * 0.50) + (reflectionPenalty * 0.10);
 }
 
 function sharpenImage(mat) {
@@ -565,45 +579,49 @@ function processVideo(){
       cv.putText(display, `Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, new cv.Point(10,120), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(hasReflection?255:0, hasReflection?0:255, 0,255),2);
 
       if (isGood) {
-        if (score > bestScore) {
-          bestScore = score;
+        // Calculate quality score for comparison
+        const qualityScore = calculateQualityScore(score, sharpness, reflectionData.reflectionRatio);
+        
+        // Store frame with quality score
+        frameHistory.push({
+          frame: src.clone(),
+          contour: bestLocalContour.clone(),
+          score: score,
+          sharpness: sharpness,
+          qualityScore: qualityScore
+        });
+        
+        if (frameHistory.length > historySize) {
+          const oldest = frameHistory.shift();
+          oldest.frame.delete();
+          oldest.contour.delete();
+        }
+        
+        // Update best score based on quality
+        if (qualityScore > bestScore) {
+          bestScore = qualityScore;
           if (bestContour) bestContour.delete();
           bestContour = bestLocalContour.clone();
-          stableCount = 0;
-          
-          frameHistory.push({
-            frame: src.clone(),
-            contour: bestLocalContour.clone(),
-            score: score,
-            sharpness: sharpness
-          });
-          if (frameHistory.length > historySize) {
-            const oldest = frameHistory.shift();
-            oldest.frame.delete();
-            oldest.contour.delete();
-          }
+          stableCount = 0; // Reset when we find better quality
         } else {
           stableCount++;
         }
-        cv.putText(display, `Stable: ${stableCount}/${requiredStableFrames}`, new cv.Point(10,150), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,255,255),2);
+        
+        cv.putText(display, `Quality: ${qualityScore.toFixed(2)}`, new cv.Point(10,150), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(255,255,0,255),2);
+        cv.putText(display, `Stable: ${stableCount}/${requiredStableFrames}`, new cv.Point(10,180), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,255,255),2);
 
         if (stableCount >= requiredStableFrames) {
-          let bestFrameData = null;
-          if (frameHistory.length > 0) {
-            bestFrameData = frameHistory[0];
-            for (let i = 1; i < frameHistory.length; i++) {
-              if (frameHistory[i].sharpness > bestFrameData.sharpness) {
-                bestFrameData = frameHistory[i];
-              }
+          // Find best frame based on quality score (not just sharpness)
+          let bestFrameData = frameHistory[0];
+          for (let i = 1; i < frameHistory.length; i++) {
+            if (frameHistory[i].qualityScore > bestFrameData.qualityScore) {
+              bestFrameData = frameHistory[i];
             }
-          } else {
-            bestFrameData = {
-              frame: src.clone(),
-              contour: bestLocalContour.clone(),
-              score: score,
-              sharpness: sharpness
-            };
           }
+          
+          console.log('Selected frame - Quality:', bestFrameData.qualityScore.toFixed(3), 
+                     'Sharpness:', bestFrameData.sharpness.toFixed(1),
+                     'Score:', bestFrameData.score.toFixed(3));
           
           if (capturedFrame) capturedFrame.delete();
           capturedFrame = bestFrameData.frame.clone();

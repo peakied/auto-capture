@@ -23,6 +23,11 @@ let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
 const historySize = 10; // Increase history size to capture more frames
 
+// Add at top with other variables
+let frameSkipCounter = 0;
+const PROCESS_EVERY_N_FRAMES = 3; // Process every 3rd frame
+let reusableTempCanvas = null; // Reuse canvas
+
 function logStatus(s){ statusEl.innerText = s; }
 
 // wait for OpenCV to be ready
@@ -466,15 +471,25 @@ function extractCardRegion(frameMat, contour){
 function processVideo(){
   if (!isProcessing) return;
   
+  // Skip frames to reduce CPU load
+  frameSkipCounter++;
+  if (frameSkipCounter % PROCESS_EVERY_N_FRAMES !== 0) {
+    requestAnimationFrame(processVideo);
+    return;
+  }
+  
   try {
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = video.videoWidth;
-    tempCanvas.height = video.videoHeight;
-    const tempCtx = tempCanvas.getContext('2d');
-    tempCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+    // Reuse canvas instead of creating new one
+    if (!reusableTempCanvas) {
+      reusableTempCanvas = document.createElement('canvas');
+    }
+    reusableTempCanvas.width = video.videoWidth;
+    reusableTempCanvas.height = video.videoHeight;
+    const tempCtx = reusableTempCanvas.getContext('2d');
+    tempCtx.drawImage(video, 0, 0, reusableTempCanvas.width, reusableTempCanvas.height);
     
     if (src) src.delete();
-    src = cv.imread(tempCanvas);
+    src = cv.imread(reusableTempCanvas);
     
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
     cv.GaussianBlur(gray, blurred, new cv.Size(5,5), 0);
@@ -553,8 +568,21 @@ function processVideo(){
 
     if (bestLocalContour) {
       const score = bestLocalScore;
-      const sharpness = calculateSharpness(src, bestLocalContour);
-      const reflectionData = detectReflection(src, bestLocalContour);
+      
+      // Only calculate sharpness if score is good enough
+      let sharpness = 0;
+      let reflectionData = { hasReflection: false, reflectionRatio: 0 };
+      
+      if (score > scoreThreshold - 0.1) { // Pre-filter by score
+        sharpness = calculateSharpness(src, bestLocalContour);
+        const isSharp = sharpness >= sharpnessThreshold;
+        
+        // Only check reflection if sharp enough
+        if (isSharp) {
+          reflectionData = detectReflection(src, bestLocalContour);
+        }
+      }
+      
       const isSharp = sharpness >= sharpnessThreshold;
       const inFrame = isCardInFrame(bestLocalContour, guideBox);
       const hasReflection = reflectionData.hasReflection;
@@ -696,7 +724,7 @@ function processVideo(){
   }
 
   if (isProcessing) {
-    setTimeout(() => requestAnimationFrame(processVideo), 33);
+    requestAnimationFrame(processVideo); // Remove setTimeout, use requestAnimationFrame directly
   }
 }
 

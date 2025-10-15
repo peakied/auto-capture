@@ -386,7 +386,7 @@ function calculateQualityScore(score, sharpness, reflectionRatio) {
 }
 
 function sharpenImage(mat) {
-  // Apply sharpening filter เหมือนใน Python
+  // Apply moderate sharpening filter
   const kernel = cv.matFromArray(3, 3, cv.CV_32FC1, [
     0, -1, 0,
     -1, 5, -1,
@@ -396,6 +396,33 @@ function sharpenImage(mat) {
   cv.filter2D(mat, sharpened, cv.CV_8U, kernel);
   kernel.delete();
   return sharpened;
+}
+
+function sharpenImageStrong(mat) {
+  // Apply STRONG sharpening - two-pass approach for best quality
+  
+  // Pass 1: Unsharp mask (professional sharpening technique)
+  const blurred = new cv.Mat();
+  cv.GaussianBlur(mat, blurred, new cv.Size(0, 0), 1.5);
+  
+  const unsharpMask = new cv.Mat();
+  cv.addWeighted(mat, 1.5, blurred, -0.5, 0, unsharpMask);
+  blurred.delete();
+  
+  // Pass 2: High-pass sharpening kernel for edges
+  const kernel = cv.matFromArray(3, 3, cv.CV_32FC1, [
+    -1, -1, -1,
+    -1,  9, -1,
+    -1, -1, -1
+  ]);
+  
+  const finalSharpened = new cv.Mat();
+  cv.filter2D(unsharpMask, finalSharpened, cv.CV_8U, kernel);
+  
+  kernel.delete();
+  unsharpMask.delete();
+  
+  return finalSharpened;
 }
 
 function extractCardRegion(frameMat, contour){
@@ -455,7 +482,13 @@ function extractCardRegion(frameMat, contour){
   // อัตราส่วนมาตรฐานของการ์ด
   const card_ratio = 86 / 54;
   
-  // คำนวณขนาดสุดท้าย
+  // CRITICAL: Set MINIMUM output resolution for sharp results
+  // Standard credit card is 85.6 × 53.98 mm
+  // Target: At least 1000px on long side (higher quality)
+  const MIN_LONG_SIDE = 1000;
+  const MIN_SHORT_SIDE = Math.floor(MIN_LONG_SIDE / card_ratio);
+  
+  // คำนวณขนาดสุดท้าย - use ACTUAL size or minimum, whichever is larger
   let finalWidth = Math.floor(width);
   let finalHeight = Math.floor(height);
   
@@ -468,6 +501,13 @@ function extractCardRegion(frameMat, contour){
     } else {
       finalHeight = Math.floor(finalWidth / card_ratio);
     }
+    
+    // Upscale if too small
+    if (finalWidth < MIN_LONG_SIDE) {
+      const scale = MIN_LONG_SIDE / finalWidth;
+      finalWidth = MIN_LONG_SIDE;
+      finalHeight = Math.floor(finalHeight * scale);
+    }
   } else {
     // portrait orientation
     const portrait_ratio = 54 / 86;
@@ -475,6 +515,13 @@ function extractCardRegion(frameMat, contour){
       finalWidth = Math.floor(finalHeight * portrait_ratio);
     } else {
       finalHeight = Math.floor(finalWidth / portrait_ratio);
+    }
+    
+    // Upscale if too small
+    if (finalHeight < MIN_LONG_SIDE) {
+      const scale = MIN_LONG_SIDE / finalHeight;
+      finalHeight = MIN_LONG_SIDE;
+      finalWidth = Math.floor(finalWidth * scale);
     }
   }
 
@@ -497,17 +544,27 @@ function extractCardRegion(frameMat, contour){
   // Get perspective transformation matrix
   const M = cv.getPerspectiveTransform(srcPts, dst);
   
-  // Apply perspective transformation
+  // Apply perspective transformation with HIGH-QUALITY interpolation
   const warped = new cv.Mat();
-  cv.warpPerspective(frameMat, warped, M, new cv.Size(finalWidth, finalHeight));
+  // CRITICAL: Use INTER_CUBIC for much better quality (vs default INTER_LINEAR)
+  // INTER_CUBIC is slower but produces much sharper results
+  cv.warpPerspective(
+    frameMat, 
+    warped, 
+    M, 
+    new cv.Size(finalWidth, finalHeight),
+    cv.INTER_CUBIC,  // High-quality bicubic interpolation
+    cv.BORDER_CONSTANT,
+    new cv.Scalar()
+  );
 
   // cleanup
   srcPts.delete();
   dst.delete();
   M.delete();
   
-  // Apply sharpening to improve clarity
-  const sharpened = sharpenImage(warped);
+  // Apply STRONGER sharpening to improve clarity
+  const sharpened = sharpenImageStrong(warped);
   warped.delete();
   
   return sharpened;
@@ -858,9 +915,9 @@ saveBtn.addEventListener('click', ()=>{
       willReadFrequently: false
     });
     
-    // Set high-quality rendering
-    tempCtx.imageSmoothingEnabled = true;
-    tempCtx.imageSmoothingQuality = 'high';
+    // CRITICAL: DISABLE image smoothing to preserve sharpness
+    // Image smoothing blurs the image - we want pixel-perfect rendering
+    tempCtx.imageSmoothingEnabled = false;
     
     // Draw the clean cropped image to temp canvas
     cv.imshow(tempCanvas, bestCropped);
@@ -881,6 +938,8 @@ saveBtn.addEventListener('click', ()=>{
     console.log('Total pixels:', (tempCanvas.width * tempCanvas.height).toLocaleString());
     console.log('Format: PNG (lossless)');
     console.log('Estimated file size:', (dataUrl.length * 0.75 / 1024).toFixed(1), 'KB');
+    console.log('Sharpening: Strong (2-pass unsharp mask + edge enhancement)');
+    console.log('Interpolation: Cubic (high-quality perspective transform)');
     
     link.click();
     

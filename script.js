@@ -56,14 +56,60 @@ if (document.readyState === 'loading') {
 
 async function startCamera() {
   try {
-    cameraStream = await navigator.mediaDevices.getUserMedia({ 
+    // Request maximum quality settings for best camera performance
+    const constraints = {
       video: {
-        width: { ideal: 1280 }, // Request higher resolution for better detection
-        height: { ideal: 720 },
-        facingMode: "environment"
-      }, 
-      audio: false 
+        // Resolution: Try for 4K, fallback to 1080p, then 720p
+        width: { ideal: 3840, min: 1280 },
+        height: { ideal: 2160, min: 720 },
+        
+        // Use rear camera (usually higher quality)
+        facingMode: { ideal: "environment" },
+        
+        // Frame rate: Higher = better motion but may reduce quality per frame
+        // 30fps is a good balance for document capture
+        frameRate: { ideal: 30, max: 60 },
+        
+        // Request best possible quality settings
+        aspectRatio: { ideal: 16/9 },
+        
+        // Advanced constraints (browser support varies)
+        focusMode: { ideal: "continuous" },  // Continuous autofocus
+        exposureMode: { ideal: "continuous" }, // Auto exposure
+        whiteBalanceMode: { ideal: "continuous" }, // Auto white balance
+        
+        // Prefer hardware acceleration
+        resizeMode: { ideal: "none" } // Don't downsample at source
+      },
+      audio: false
+    };
+    
+    try {
+      // Try with all advanced features first
+      cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      console.log("Advanced constraints failed, trying basic high-res:", err);
+      // Fallback: Try without advanced constraints
+      cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 3840, min: 1280 },
+          height: { ideal: 2160, min: 720 },
+          facingMode: "environment",
+          frameRate: { ideal: 30 }
+        },
+        audio: false
+      });
+    }
+    
+    // Log actual capabilities achieved
+    const videoTrack = cameraStream.getVideoTracks()[0];
+    const settings = videoTrack.getSettings();
+    console.log("Camera settings achieved:", {
+      resolution: `${settings.width}x${settings.height}`,
+      frameRate: settings.frameRate,
+      facingMode: settings.facingMode
     });
+    
     video.srcObject = cameraStream;
     video.play();
     video.onloadedmetadata = () => {
@@ -482,10 +528,25 @@ function processVideo(){
     // Reuse canvas instead of creating new one
     if (!reusableTempCanvas) {
       reusableTempCanvas = document.createElement('canvas');
+      // Configure canvas context for high quality
+      const ctx = reusableTempCanvas.getContext('2d', {
+        alpha: false,
+        desynchronized: false,
+        willReadFrequently: true // We read frequently for processing
+      });
+      // Store context reference
+      reusableTempCanvas._ctx = ctx;
     }
+    
     reusableTempCanvas.width = video.videoWidth;
     reusableTempCanvas.height = video.videoHeight;
-    const tempCtx = reusableTempCanvas.getContext('2d');
+    const tempCtx = reusableTempCanvas._ctx || reusableTempCanvas.getContext('2d');
+    
+    // Use high-quality image smoothing for better capture
+    tempCtx.imageSmoothingEnabled = true;
+    tempCtx.imageSmoothingQuality = 'high';
+    
+    // Capture frame with full quality
     tempCtx.drawImage(video, 0, 0, reusableTempCanvas.width, reusableTempCanvas.height);
     
     if (src) src.delete();
@@ -641,15 +702,24 @@ function processVideo(){
         if (stableCount >= requiredStableFrames) {
           // Find best frame based on quality score (not just sharpness)
           let bestFrameData = frameHistory[0];
+          let bestFrameIndex = 0;
           for (let i = 1; i < frameHistory.length; i++) {
             if (frameHistory[i].qualityScore > bestFrameData.qualityScore) {
               bestFrameData = frameHistory[i];
+              bestFrameIndex = i;
             }
           }
           
-          console.log('Selected frame - Quality:', bestFrameData.qualityScore.toFixed(3), 
-                     'Sharpness:', bestFrameData.sharpness.toFixed(1),
-                     'Score:', bestFrameData.score.toFixed(3));
+          console.log('=== FRAME SELECTION ===');
+          console.log(`Selected frame ${bestFrameIndex + 1} of ${frameHistory.length} frames`);
+          console.log('Best frame stats:');
+          console.log('  Quality Score:', bestFrameData.qualityScore.toFixed(3));
+          console.log('  Sharpness:', bestFrameData.sharpness.toFixed(1));
+          console.log('  Position Score:', bestFrameData.score.toFixed(3));
+          console.log('All frames comparison:');
+          frameHistory.forEach((f, idx) => {
+            console.log(`  Frame ${idx + 1}: Quality=${f.qualityScore.toFixed(3)}, Sharp=${f.sharpness.toFixed(1)}, Score=${f.score.toFixed(3)}${idx === bestFrameIndex ? ' <- SELECTED' : ''}`);
+          });
           
           if (capturedFrame) capturedFrame.delete();
           capturedFrame = bestFrameData.frame.clone();
@@ -759,32 +829,62 @@ saveBtn.addEventListener('click', ()=>{
     return; 
   }
   
+  console.log('=== CROPPING CARD ===');
+  console.log('Input frame size:', capturedFrame.cols, 'x', capturedFrame.rows);
+  console.log('Contour points:', bestContour.rows);
+  
   // Extract the card region จากภาพต้นฉบับที่ไม่มีกรอบ (capturedFrame)
   if (bestCropped) bestCropped.delete();
   bestCropped = extractCardRegion(capturedFrame, bestContour);
+  
+  console.log('Output cropped size:', bestCropped.cols, 'x', bestCropped.rows);
+  console.log('Aspect ratio:', (bestCropped.cols / bestCropped.rows).toFixed(2));
   
   // Show the cropped and sharpened card (ไม่มีกรอบเขียว)
   cv.imshow(canvasOutput, bestCropped);
   logStatus("Card cropped and sharpened! Downloading...");
   
-  // Auto-download - Create a temporary canvas for clean output
+  // Auto-download - Create a temporary canvas for clean, high-quality output
   setTimeout(() => {
     // Create a temporary canvas to ensure clean output
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = bestCropped.cols;
     tempCanvas.height = bestCropped.rows;
-    const tempCtx = tempCanvas.getContext('2d');
+    
+    // Use 2d context with high-quality settings
+    const tempCtx = tempCanvas.getContext('2d', {
+      alpha: false, // No transparency = better compression
+      desynchronized: false, // Prioritize quality over speed
+      willReadFrequently: false
+    });
+    
+    // Set high-quality rendering
+    tempCtx.imageSmoothingEnabled = true;
+    tempCtx.imageSmoothingQuality = 'high';
     
     // Draw the clean cropped image to temp canvas
     cv.imshow(tempCanvas, bestCropped);
     
-    // Download from temp canvas
+    // Download with maximum quality PNG
     const link = document.createElement('a');
-    link.download = 'cropped_card.png';
-    link.href = tempCanvas.toDataURL('image/png', 1.0); // คุณภาพสูงสุด
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    link.download = `card_${timestamp}.png`;
+    
+    // PNG with maximum quality (lossless)
+    // Note: PNG quality parameter is ignored (always lossless), but 1.0 is convention
+    const dataUrl = tempCanvas.toDataURL('image/png', 1.0);
+    link.href = dataUrl;
+    
+    console.log('=== SAVING CARD ===');
+    console.log('Filename:', link.download);
+    console.log('Resolution:', tempCanvas.width, 'x', tempCanvas.height);
+    console.log('Total pixels:', (tempCanvas.width * tempCanvas.height).toLocaleString());
+    console.log('Format: PNG (lossless)');
+    console.log('Estimated file size:', (dataUrl.length * 0.75 / 1024).toFixed(1), 'KB');
+    
     link.click();
     
-    logStatus("Card saved! Click 'Start Camera' to capture another card.");
+    logStatus("Card saved in high quality! Click 'Start Camera' to capture another card.");
   }, 100);
 });                                                                              
 

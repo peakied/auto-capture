@@ -258,7 +258,7 @@ function detectReflection(frameMatColor, contour) {
   // 1. มีพื้นที่สว่างเกินไปมากกว่า 15%
   // 2. หรือมี spike reflection ที่สว่างกว่าค่าเฉลี่ยมาก
   return {
-    hasReflection: reflectionRatio > 0.15 || hasSpikeReflection,
+    hasReflection: reflectionRatio > 0.3 || hasSpikeReflection,
     reflectionRatio: reflectionRatio,
     hasSpikeReflection: hasSpikeReflection
   };

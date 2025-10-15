@@ -380,9 +380,9 @@ function calculateCardScore(contour, frameShape){
 function calculateQualityScore(score, sharpness, reflectionRatio) {
   const normalizedSharpness = Math.min(sharpness / 100.0, 1.0);
   const reflectionPenalty = Math.max(0, 1.0 - (reflectionRatio * 2)); // Penalize reflection
-  
-  // Combined quality: 40% positioning, 50% sharpness, 10% reflection penalty
-  return (score * 0.40) + (normalizedSharpness * 0.50) + (reflectionPenalty * 0.10);
+
+  // Combined quality: 30% positioning, 60% sharpness, 10% reflection penalty
+  return (score * 0.30) + (normalizedSharpness * 0.60) + (reflectionPenalty * 0.10);
 }
 
 function sharpenImage(mat) {

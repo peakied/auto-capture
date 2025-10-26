@@ -2,17 +2,18 @@
 let video = document.getElementById('video');
 let canvasOutput = document.getElementById('canvasOutput');
 let statusEl = document.getElementById('status');
+let saveBtn = document.getElementById('saveBtn');
+let toggleBlurWarn = document.getElementById('toggleBlurWarn');
 let toggleCameraBtn = document.getElementById('toggleCameraBtn');
-let downloadImageBtn = document.getElementById('downloadImageBtn'); // Add reference to the button
 
 let streaming = false;
 let src = null, gray = null, blurred = null;
 let contours = null, hierarchy = null;
 let cap = null;
+let bestCropped = null;
 let cameraStream = null;
 let isProcessing = false;
 let capturedFrame = null; // Store the captured frame
-let croppedCardImage = null; // Store the cropped card image
 
 // onnxruntime-web session for YOLO
 let ortSession = null;
@@ -22,22 +23,19 @@ let yoloProviders = [];
 const yoloScoreThresh = 0.4;   // confidence threshold for detections
 const yoloNmsIouThresh = 0.45; // NMS IoU threshold
 
-const scoreThreshold = 0.50; // Lower threshold for easier detection
-const sharpnessThreshold = 25; // Lower for more flexibility
-const requiredStableFrames = 10; // Reduce for faster detection
-
+const scoreThreshold = 0.60; // card positioning threshold (our combined score)
+const sharpnessThreshold = 35; // Slightly lower for more flexibility
+const requiredStableFrames = 15; // Increase to get more samples
 const inFrameThreshold = 0.7;
 let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
-const historySize = 8; // Reduce history size
+const historySize = 10; // Increase history size to capture more frames
 
 // Add at top with other variables
 let frameSkipCounter = 0;
 const PROCESS_EVERY_N_FRAMES = 2; // Process every 2nd frame with GPU accel
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
-let toggleBlurWarn = document.getElementById('toggleBlurWarn'); // Add missing reference
-
 
 function logStatus(s){ statusEl.innerText = s; }
 
@@ -131,9 +129,8 @@ function initializeMats(){
   const w = video.videoWidth;
   console.log('Video dimensions:', w, 'x', h);
   
-  // Set canvas to 50% of video size for display
-  canvasOutput.width = w * 0.5;
-  canvasOutput.height = h * 0.5;
+  canvasOutput.width = w;
+  canvasOutput.height = h;
   
   // Don't use VideoCapture, we'll capture from canvas instead
   cap = null;
@@ -144,7 +141,7 @@ function initializeMats(){
   contours = new cv.MatVector();
   hierarchy = new cv.Mat();
   
-  console.log('Mats initialized - Canvas size:', canvasOutput.width, 'x', canvasOutput.height);
+  console.log('Mats initialized');
 }
 
 function toDegree(rad){ return Math.abs(rad * 180.0 / Math.PI); }
@@ -286,7 +283,7 @@ function detectReflection(frameMatColor, contour) {
   // 1. มีพื้นที่สว่างเกินไปมากกว่า 15%
   // 2. หรือมี spike reflection ที่สว่างกว่าค่าเฉลี่ยมาก
   return {
-    hasReflection: reflectionRatio > 0.3 || hasSpikeReflection,
+    hasReflection: reflectionRatio > 0.15 || hasSpikeReflection,
     reflectionRatio: reflectionRatio,
     hasSpikeReflection: hasSpikeReflection
   };
@@ -304,26 +301,21 @@ function contourToMat(contourPts){
 
 function isCardInFrame(cardContour, frameBox) {
   // ตรวจสอบว่าบัตรอยู่ในกรอบหรือไม่
-  if (!cardContour || cardContour.isDeleted() || cardContour.rows !== 4) return false;
+  if (!cardContour || cardContour.rows !== 4) return false;
   
-  try {
-    let pointsInside = 0;
-    for (let i = 0; i < 4; i++) {
-      const x = cardContour.intAt(i, 0);
-      const y = cardContour.intAt(i, 1);
-      
-      if (x >= frameBox.x && x <= frameBox.x + frameBox.width &&
-          y >= frameBox.y && y <= frameBox.y + frameBox.height) {
-        pointsInside++;
-      }
-    }
+  let pointsInside = 0;
+  for (let i = 0; i < 4; i++) {
+    const x = cardContour.intAt(i, 0);
+    const y = cardContour.intAt(i, 1);
     
-    // อย่างน้อย 3 ใน 4 มุมต้องอยู่ในกรอบ
-    return pointsInside >= 3;
-  } catch (error) {
-    console.warn('Error in isCardInFrame:', error);
-    return false;
+    if (x >= frameBox.x && x <= frameBox.x + frameBox.width &&
+        y >= frameBox.y && y <= frameBox.y + frameBox.height) {
+      pointsInside++;
+    }
   }
+  
+  // อย่างน้อย 3 ใน 4 มุมต้องอยู่ในกรอบ
+  return pointsInside >= 3;
 }
 
 function calculateCardScore(contour, frameShape){
@@ -385,202 +377,119 @@ function sharpenImage(mat) {
   return sharpened;
 }
 
-// Add after helpers: perspective crop from 4-point contour
-function crop(imageMatColor, quadContour, options = {}) {
-  // Options:
-  // - outputWidth: target width of cropped card (default 860)
-  // - enforceRatio: keep standard card ratio 86:54 (default true)
-  const outputWidth = options.outputWidth ?? 860;
-  const enforceRatio = options.enforceRatio ?? true;
-  const CARD_RATIO = 86 / 54; // width / height
-
-  if (!imageMatColor || !quadContour || quadContour.rows !== 4) {
-    console.warn('crop(): invalid input');
-    return null;
+function extractCardRegion(frameMat, contour){
+  // expects contour with 4 points (cv.CV_32SC2)
+  if (contour.rows !== 4){
+    const r = cv.boundingRect(contour);
+    const padx = Math.floor(r.width * 0.05), pady = Math.floor(r.height * 0.05);
+    const x = Math.max(0, r.x - padx), y = Math.max(0, r.y - pady);
+    const w = Math.min(frameMat.cols - x, r.width + 2*padx), h = Math.min(frameMat.rows - y, r.height + 2*pady);
+    return frameMat.roi(new cv.Rect(x,y,w,h)).clone();
   }
 
-  // Extract 4 points from contour mat
-  function mat4ToPointsArray(mat) {
-    const pts = [];
-    for (let i = 0; i < 4; i++) {
-      let x, y;
-      // Support both CV_32SC2 and CV_32FC2
-      if (mat.type() === cv.CV_32SC2) {
-        const p = mat.intPtr(i, 0);
-        x = p[0]; y = p[1];
-      } else {
-        const p = mat.floatPtr(i, 0);
-        x = p[0]; y = p[1];
-      }
-      pts.push({ x, y });
-    }
-    return pts;
+  // Get the four corners
+  let points = [];
+  for (let i=0;i<4;i++){
+    points.push([contour.intAt(i,0), contour.intAt(i,1)]);
   }
-
-  // Order points: [tl, tr, br, bl]
-  function orderQuadPoints(pts) {
-    // Sum and diff method
-    let tl = pts[0], tr = pts[0], br = pts[0], bl = pts[0];
-    let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
-    for (const p of pts) {
-      const s = p.x + p.y;
-      const d = p.x - p.y;
-      if (s < minSum) { minSum = s; tl = p; }
-      if (s > maxSum) { maxSum = s; br = p; }
-      if (d < minDiff) { minDiff = d; bl = p; }
-      if (d > maxDiff) { maxDiff = d; tr = p; }
-    }
-    return [tl, tr, br, bl];
+  
+  // Sort points properly: top-left, top-right, bottom-right, bottom-left
+  // ใช้วิธีที่แม่นยำกว่า โดยเรียงตาม y ก่อน แล้วค่อยเรียงตาม x
+  points.sort((a, b) => a[1] - b[1]); // เรียงตาม y
+  
+  let rect = new Array(4);
+  // 2 จุดบนสุด
+  let topPoints = [points[0], points[1]];
+  topPoints.sort((a, b) => a[0] - b[0]); // เรียงตาม x
+  rect[0] = topPoints[0]; // top-left
+  rect[1] = topPoints[1]; // top-right
+  
+  // 2 จุดล่างสุด
+  let bottomPoints = [points[2], points[3]];
+  bottomPoints.sort((a, b) => a[0] - b[0]); // เรียงตาม x
+  rect[3] = bottomPoints[0]; // bottom-left
+  rect[2] = bottomPoints[1]; // bottom-right
+  
+  // Expand the corners slightly outward (3% expansion)
+  const center_x = (rect[0][0] + rect[1][0] + rect[2][0] + rect[3][0]) / 4.0;
+  const center_y = (rect[0][1] + rect[1][1] + rect[2][1] + rect[3][1]) / 4.0;
+  const expansion_factor = 1.03;
+  
+  for (let i = 0; i < 4; i++) {
+    const direction_x = rect[i][0] - center_x;
+    const direction_y = rect[i][1] - center_y;
+    rect[i][0] = center_x + direction_x * expansion_factor;
+    rect[i][1] = center_y + direction_y * expansion_factor;
   }
-
-  const srcPts = orderQuadPoints(mat4ToPointsArray(quadContour));
-
-  // Measure current dimensions
-  const widthA  = Math.hypot(srcPts[2].x - srcPts[3].x, srcPts[2].y - srcPts[3].y); // br-bl
-  const widthB  = Math.hypot(srcPts[1].x - srcPts[0].x, srcPts[1].y - srcPts[0].y); // tr-tl
-  const heightA = Math.hypot(srcPts[1].x - srcPts[2].x, srcPts[1].y - srcPts[2].y); // tr-br
-  const heightB = Math.hypot(srcPts[0].x - srcPts[3].x, srcPts[0].y - srcPts[3].y); // tl-bl
-
-  // Decide output size
-  let dstW = Math.max(Math.round(Math.max(widthA, widthB)), 100);
-  let dstH = Math.max(Math.round(Math.max(heightA, heightB)), 100);
-
-  // If enforceRatio, override using target width and compute height by ratio
-  if (enforceRatio) {
-    dstW = outputWidth;
-    dstH = Math.max(1, Math.round(dstW / CARD_RATIO));
-  }
-
-  // Build transform
-  const srcQuad = cv.matFromArray(4, 1, cv.CV_32FC2, [
-    srcPts[0].x, srcPts[0].y, // tl
-    srcPts[1].x, srcPts[1].y, // tr
-    srcPts[2].x, srcPts[2].y, // br
-    srcPts[3].x, srcPts[3].y  // bl
-  ]);
-  const dstQuad = cv.matFromArray(4, 1, cv.CV_32FC2, [
-    0, 0,
-    dstW - 1, 0,
-    dstW - 1, dstH - 1,
-    0, dstH - 1
-  ]);
-
-  const M = cv.getPerspectiveTransform(srcQuad, dstQuad);
-  const warped = new cv.Mat();
-  cv.warpPerspective(imageMatColor, warped, M, new cv.Size(dstW, dstH), cv.INTER_LINEAR, cv.BORDER_REPLICATE);
-
-  // Cleanup
-  srcQuad.delete();
-  dstQuad.delete();
-  M.delete();
-
-  return warped; // Caller must delete()
-}
-
-// Enhanced crop function with better error handling and options
-function cropCardToStandardSize(imageMatColor, quadContour, options = {}) {
-  const outputWidth = options.outputWidth ?? 860;
-  const outputHeight = options.outputHeight ?? 540;
-  const enforceRatio = options.enforceRatio ?? true;
-  const addPadding = options.addPadding ?? 10;
-
-  if (!imageMatColor || imageMatColor.isDeleted() || 
-      !quadContour || quadContour.isDeleted() || quadContour.rows !== 4) {
-    console.warn('cropCardToStandardSize(): invalid input');
-    return null;
-  }
-
-  try {
-    // Get the basic crop first
-    const basicCrop = crop(imageMatColor, quadContour, { outputWidth, enforceRatio });
-    if (!basicCrop || basicCrop.isDeleted()) return null;
-
-    // Apply sharpening to enhance the cropped image
-    const sharpened = sharpenImage(basicCrop);
-    if (basicCrop && !basicCrop.isDeleted()) basicCrop.delete();
-
-    if (!sharpened || sharpened.isDeleted()) return null;
-
-    // Add padding if requested
-    if (addPadding > 0) {
-      const paddedWidth = sharpened.cols + (addPadding * 2);
-      const paddedHeight = sharpened.rows + (addPadding * 2);
-      const padded = new cv.Mat(paddedHeight, paddedWidth, sharpened.type(), new cv.Scalar(255, 255, 255, 255));
-      
-      const roi = padded.roi(new cv.Rect(addPadding, addPadding, sharpened.cols, sharpened.rows));
-      sharpened.copyTo(roi);
-      if (roi && !roi.isDeleted()) roi.delete();
-      if (sharpened && !sharpened.isDeleted()) sharpened.delete();
-      
-      return padded;
-    }
-
-    return sharpened;
-  } catch (error) {
-    console.error('Error in cropCardToStandardSize:', error);
-    return null;
-  }
-}
-
-// Function to display cropped card
-function displayCroppedCard(imageMat, contour) {
-  if (!imageMat || imageMat.isDeleted() || !contour || contour.isDeleted()) {
-    console.warn('displayCroppedCard: invalid input - imageMat:', !!imageMat, 'contour:', !!contour);
-    return false;
-  }
-
-  try {
-    // Clean up previous cropped image
-    if (croppedCardImage && !croppedCardImage.isDeleted()) {
-      croppedCardImage.delete();
-      croppedCardImage = null;
-    }
-
-    // Crop the card to standard size
-    croppedCardImage = cropCardToStandardSize(imageMat, contour, {
-      outputWidth: 860,
-      enforceRatio: true,
-      addPadding: 20
-    });
-
-    console.log('Cropped image result:', !!croppedCardImage, croppedCardImage ? 'size: ' + croppedCardImage.cols + 'x' + croppedCardImage.rows : 'null');
-
-    if (croppedCardImage && !croppedCardImage.isDeleted()) {
-      // Resize canvas to fit cropped card at 50% size for display
-      canvasOutput.width = croppedCardImage.cols * 0.5;
-      canvasOutput.height = croppedCardImage.rows * 0.5;
-      
-      // Create a display version at 50% size
-      const displayMat = new cv.Mat();
-      cv.resize(croppedCardImage, displayMat, new cv.Size(canvasOutput.width, canvasOutput.height));
-      
-      // Display the resized cropped card
-      cv.imshow(canvasOutput, displayMat);
-      displayMat.delete();
-      
-      // Create overlay with text on the canvas context directly
-      const ctx = canvasOutput.getContext('2d');
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-      ctx.fillRect(5, 5, 200, 50);
-      
-      ctx.fillStyle = 'white';
-      ctx.font = 'bold 12px Arial';
-      ctx.fillText('Cropped Card - Standard Size', 10, 20);
-      
-      ctx.font = '10px Arial';
-      ctx.fillText(`Size: ${croppedCardImage.cols} x ${croppedCardImage.rows}`, 10, 32);
-      ctx.fillText('Click "Download" to save', 10, 42);
-      
-      enableDownloadButton();
-      console.log('Download button should now be enabled');
-      return true;
+  
+  // คำนวณความกว้างและความสูงจริงของการ์ด
+  const width_top = Math.sqrt(Math.pow(rect[1][0] - rect[0][0], 2) + Math.pow(rect[1][1] - rect[0][1], 2));
+  const width_bottom = Math.sqrt(Math.pow(rect[2][0] - rect[3][0], 2) + Math.pow(rect[2][1] - rect[3][1], 2));
+  const width = Math.max(width_top, width_bottom);
+  
+  const height_left = Math.sqrt(Math.pow(rect[3][0] - rect[0][0], 2) + Math.pow(rect[3][1] - rect[0][1], 2));
+  const height_right = Math.sqrt(Math.pow(rect[2][0] - rect[1][0], 2) + Math.pow(rect[2][1] - rect[1][1], 2));
+  const height = Math.max(height_left, height_right);
+  
+  // อัตราส่วนมาตรฐานของการ์ด
+  const card_ratio = 86 / 54;
+  
+  // คำนวณขนาดสุดท้าย
+  let finalWidth = Math.floor(width);
+  let finalHeight = Math.floor(height);
+  
+  const current_ratio = width / height;
+  
+  if (current_ratio > 1) {
+    // landscape orientation
+    if (current_ratio > card_ratio) {
+      finalWidth = Math.floor(finalHeight * card_ratio);
     } else {
-      console.warn('Failed to create cropped image');
+      finalHeight = Math.floor(finalWidth / card_ratio);
     }
-  } catch (error) {
-    console.error('Error in displayCroppedCard:', error);
+  } else {
+    // portrait orientation
+    const portrait_ratio = 54 / 86;
+    if (current_ratio > portrait_ratio) {
+      finalWidth = Math.floor(finalHeight * portrait_ratio);
+    } else {
+      finalHeight = Math.floor(finalWidth / portrait_ratio);
+    }
   }
-  return false;
+
+  // Define destination points for perspective transform
+  const dst = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    0, 0,
+    finalWidth - 1, 0,
+    finalWidth - 1, finalHeight - 1,
+    0, finalHeight - 1
+  ]);
+  
+  // Source points (ตรงตามลำดับ: TL, TR, BR, BL)
+  const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    rect[0][0], rect[0][1],  // top-left
+    rect[1][0], rect[1][1],  // top-right
+    rect[2][0], rect[2][1],  // bottom-right
+    rect[3][0], rect[3][1]   // bottom-left
+  ]);
+  
+  // Get perspective transformation matrix
+  const M = cv.getPerspectiveTransform(srcPts, dst);
+  
+  // Apply perspective transformation
+  const warped = new cv.Mat();
+  cv.warpPerspective(frameMat, warped, M, new cv.Size(finalWidth, finalHeight));
+
+  // cleanup
+  srcPts.delete();
+  dst.delete();
+  M.delete();
+  
+  // Apply sharpening to improve clarity
+  const sharpened = sharpenImage(warped);
+  warped.delete();
+  
+  return sharpened;
 }
 
 // ================== YOLO (ONNX Runtime Web) helpers ==================
@@ -844,22 +753,10 @@ async function processVideo(){
     const tempCtx = reusableTempCanvas.getContext('2d');
     tempCtx.drawImage(video, 0, 0, reusableTempCanvas.width, reusableTempCanvas.height);
     
-    if (src && !src.isDeleted()) src.delete();
+    if (src) src.delete();
     src = cv.imread(reusableTempCanvas);
     
     let display = src.clone();
-    
-    // Show Canny edges if enabled (press 'C' key to toggle)
-    if (showCannyMode) {
-      const cannyDisplay = new cv.Mat();
-      cv.cvtColor(edges, cannyDisplay, cv.COLOR_GRAY2RGBA);
-      cv.addWeighted(display, 0.7, cannyDisplay, 0.3, 0, display);
-      cannyDisplay.delete();
-      
-      cv.putText(display, "Canny Edges (Press C to toggle)", 
-                new cv.Point(10, display.rows - 20), 
-                cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(255, 255, 0, 255), 2);
-    }
     
     const frameW = src.cols;
     const frameH = src.rows;
@@ -923,22 +820,15 @@ async function processVideo(){
 
       const score = calculateCardScore(bestLocalContour, {width: src.cols, height: src.rows});
       
-      // Only draw contours when Canny mode is enabled
-      if (showCannyMode) {
-        const bestContourVec = new cv.MatVector();
-        bestContourVec.push_back(bestLocalContour);
-        cv.drawContours(display, bestContourVec, 0, new cv.Scalar(0, 255, 255, 255), 3);
-        bestContourVec.delete();
-      }
-      
       // Only calculate sharpness if score is good enough
       let sharpness = 0;
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
       
-      if (score > scoreThreshold - 0.2) {
+      if (score > scoreThreshold - 0.1) { // Pre-filter by score
         sharpness = calculateSharpness(src, bestLocalContour);
         const isSharp = sharpness >= sharpnessThreshold;
         
+        // Only check reflection if sharp enough
         if (isSharp) {
           reflectionData = detectReflection(src, bestLocalContour);
         }
@@ -949,12 +839,21 @@ async function processVideo(){
       const hasReflection = reflectionData.hasReflection;
       const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection;
 
+      // REMOVE OR COMMENT OUT THESE LINES (lines 405-410)
+      // const contourVec = new cv.MatVector();
+      // contourVec.push_back(bestLocalContour);
+      // const color = isGood ? new cv.Scalar(0,255,0,255) : 
+      //               inFrame ? new cv.Scalar(0,165,255,255) : 
+      //               new cv.Scalar(255,0,0,255);
+      // cv.drawContours(display, contourVec, 0, color, 2);
+      // contourVec.delete();
+
       const color = isGood ? new cv.Scalar(0,255,0,255) : 
                     inFrame ? new cv.Scalar(0,165,255,255) : 
                     new cv.Scalar(255,0,0,255);
 
-      cv.putText(display, `Score: ${score.toFixed(2)} (need: ${scoreThreshold})`, new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.7, color,2);
-      cv.putText(display, `Sharp: ${sharpness.toFixed(1)} (need: ${sharpnessThreshold})`, new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(isSharp?0:255, isSharp?255:0, 0,255),2);
+      cv.putText(display, `Score: ${score.toFixed(2)}`, new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.9, color,2);
+      cv.putText(display, `Sharp: ${sharpness.toFixed(1)}`, new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(isSharp?0:255, isSharp?255:0, 0,255),2);
       cv.putText(display, `In Frame: ${inFrame?'YES':'NO'}`, new cv.Point(10,90), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(inFrame?0:255, inFrame?255:0, 0,255),2);
       cv.putText(display, `Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, new cv.Point(10,120), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(hasReflection?255:0, hasReflection?0:255, 0,255),2);
 
@@ -973,16 +872,16 @@ async function processVideo(){
         
         if (frameHistory.length > historySize) {
           const oldest = frameHistory.shift();
-          if (oldest.frame && !oldest.frame.isDeleted()) oldest.frame.delete();
-          if (oldest.contour && !oldest.contour.isDeleted()) oldest.contour.delete();
+          oldest.frame.delete();
+          oldest.contour.delete();
         }
         
         // Update best score based on quality
         if (qualityScore > bestScore) {
           bestScore = qualityScore;
-          if (bestContour && !bestContour.isDeleted()) bestContour.delete();
+          if (bestContour) bestContour.delete();
           bestContour = bestLocalContour.clone();
-          stableCount = 0;
+          stableCount = 0; // Reset when we find better quality
         } else {
           stableCount++;
         }
@@ -991,7 +890,7 @@ async function processVideo(){
         cv.putText(display, `Stable: ${stableCount}/${requiredStableFrames}`, new cv.Point(10,180), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,255,255),2);
 
         if (stableCount >= requiredStableFrames) {
-          // Find best frame based on quality score
+          // Find best frame based on quality score (not just sharpness)
           let bestFrameData = frameHistory[0];
           for (let i = 1; i < frameHistory.length; i++) {
             if (frameHistory[i].qualityScore > bestFrameData.qualityScore) {
@@ -1003,16 +902,18 @@ async function processVideo(){
                      'Sharpness:', bestFrameData.sharpness.toFixed(1),
                      'Score:', bestFrameData.score.toFixed(3));
           
-          if (capturedFrame && !capturedFrame.isDeleted()) capturedFrame.delete();
+          if (capturedFrame) capturedFrame.delete();
           capturedFrame = bestFrameData.frame.clone();
 
-          if (bestContour && !bestContour.isDeleted()) bestContour.delete();
+          if (bestContour) bestContour.delete();
           bestContour = bestFrameData.contour.clone();
           
-          // Clean up frame history
+          if (bestCropped) bestCropped.delete();
+          bestCropped = null;
+          
           frameHistory.forEach(f => {
-            if (f.frame && !f.frame.isDeleted()) f.frame.delete();
-            if (f.contour && !f.contour.isDeleted()) f.contour.delete();
+            f.frame.delete();
+            f.contour.delete();
           });
           frameHistory = [];
           
@@ -1024,30 +925,18 @@ async function processVideo(){
           
           const displayFrame = capturedFrame.clone();
           // Draw nothing on final capture; keep clean
-          console.log('Attempting to display cropped card...');
           
-          // Display cropped card instead of full frame
-          const cropSuccess = displayCroppedCard(capturedFrame, bestContour);
+          cv.putText(displayFrame, "Card Detected! Click 'Crop Card' to extract", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,0,255),2);
+          cv.imshow(canvasOutput, displayFrame);
+          displayFrame.delete();
           
-          if (!cropSuccess) {
-            console.warn('Cropping failed, showing original frame and enabling download anyway');
-            // Fallback to original display if cropping fails
-            const displayFrame = capturedFrame.clone();
-            cv.putText(displayFrame, "Card Detected! (Crop failed)", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(255,255,0,255),2);
-            cv.imshow(canvasOutput, displayFrame);
-            if (displayFrame && !displayFrame.isDeleted()) displayFrame.delete();
-            
-            // Enable download button even if cropping failed
-            enableDownloadButton();
-          }
-
-          logStatus("Card detected and cropped! Click 'Download Image' to save.");
+          logStatus("Card detected! Click 'Crop Card' to extract or 'Start Camera' to retry.");
         }
       } else {
         stableCount = 0;
         frameHistory.forEach(f => {
-          if (f.frame && !f.frame.isDeleted()) f.frame.delete();
-          if (f.contour && !f.contour.isDeleted()) f.contour.delete();
+          f.frame.delete();
+          f.contour.delete();
         });
         frameHistory = [];
         
@@ -1066,130 +955,26 @@ async function processVideo(){
     } else {
       stableCount = 0;
       frameHistory.forEach(f => {
-        if (f.frame && !f.frame.isDeleted()) f.frame.delete();
-        if (f.contour && !f.contour.isDeleted()) f.contour.delete();
+        f.frame.delete();
+        f.contour.delete();
       });
       frameHistory = [];
       
-      cv.putText(display, "No rectangular card detected", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.8, new cv.Scalar(0,0,255,255),2);
-      cv.putText(display, "Try better lighting or card positioning", new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(0,0,255,255),2);
-      cv.putText(display, "Press 'C' to toggle Canny edge view", new cv.Point(10,90), cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(255,255,0,255),2);
+      cv.putText(display, "No card detected", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.9, new cv.Scalar(0,0,255,255),2);
+      cv.putText(display, "Place card in the frame", new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(0,0,255,255),2);
     }
 
     cv.imshow(canvasOutput, display);
     display.delete();
 
   } catch (err){
-    console.error('Processing error:', err);
+    console.error(err);
     logStatus("Processing error: " + err);
   }
 
   if (isProcessing) {
-    requestAnimationFrame(processVideo);
+    requestAnimationFrame(processVideo); // Remove setTimeout, use requestAnimationFrame directly
   }
-}
-
-// Enhanced download function with better fallback
-function downloadImage() {
-  let imageToDownload = null;
-  let needsCleanup = false;
-  let filename = 'card';
-
-  console.log('Download attempt - croppedCardImage exists:', !!croppedCardImage, 
-              'capturedFrame exists:', !!capturedFrame, 
-              'bestContour exists:', !!bestContour);
-
-  if (croppedCardImage && !croppedCardImage.isDeleted()) {
-    console.log('Using existing cropped image');
-    imageToDownload = croppedCardImage;
-    filename = 'cropped-card';
-  } else if (capturedFrame && !capturedFrame.isDeleted() && 
-             bestContour && !bestContour.isDeleted()) {
-    console.log('Creating cropped image on demand');
-    imageToDownload = cropCardToStandardSize(capturedFrame, bestContour, {
-      outputWidth: 860,
-      enforceRatio: true,
-      addPadding: 20
-    });
-    needsCleanup = true;
-    filename = 'cropped-card';
-  } else if (capturedFrame && !capturedFrame.isDeleted()) {
-    console.log('Using original captured frame as fallback');
-    imageToDownload = capturedFrame;
-    filename = 'original-card';
-  }
-
-  if (!imageToDownload || imageToDownload.isDeleted()) {
-    console.warn("No image available to download.");
-    logStatus("No image available to download.");
-    return;
-  }
-
-  try {
-    // Create a clean temporary canvas for download (without overlay text)
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = imageToDownload.cols;
-    tempCanvas.height = imageToDownload.rows;
-    
-    // Show the clean image on temporary canvas
-    cv.imshow(tempCanvas, imageToDownload);
-
-    // Create download link
-    const link = document.createElement('a');
-    link.href = tempCanvas.toDataURL('image/png');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
-    link.download = `${filename}-${timestamp}.png`;
-    
-    // Trigger download
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-
-    // Cleanup
-    tempCanvas.remove();
-    
-    if (needsCleanup && imageToDownload && !imageToDownload.isDeleted()) {
-      imageToDownload.delete();
-    }
-    
-    logStatus("Image downloaded successfully!");
-    console.log('Image downloaded successfully as:', link.download);
-    
-    // Visual feedback
-    downloadImageBtn.textContent = 'Downloaded!';
-    downloadImageBtn.style.backgroundColor = '#28a745';
-    setTimeout(() => {
-      downloadImageBtn.textContent = 'Download Cropped Card';
-      downloadImageBtn.style.backgroundColor = '#4CAF50';
-    }, 2000);
-    
-  } catch (error) {
-    console.error('Download error:', error);
-    logStatus("Download failed: " + error.message);
-    
-    // Error feedback
-    downloadImageBtn.textContent = 'Download Failed';
-    downloadImageBtn.style.backgroundColor = '#dc3545';
-    setTimeout(() => {
-      downloadImageBtn.textContent = 'Download Cropped Card';
-      downloadImageBtn.style.backgroundColor = '#4CAF50';
-    }, 2000);
-  }
-}
-
-// Enable download button after capturing the frame
-function enableDownloadButton() {
-  console.log('Enabling download button');
-  downloadImageBtn.disabled = false;
-  downloadImageBtn.style.backgroundColor = '#4CAF50';
-  downloadImageBtn.style.color = 'white';
-  downloadImageBtn.textContent = 'Download Cropped Card';
-  
-  // Remove any existing event listeners and add new one
-  downloadImageBtn.onclick = null;
-  downloadImageBtn.addEventListener('click', downloadImage, { once: false });
-  
-  console.log('Download button enabled and event listener attached');
 }
 
 // Toggle camera on/off
@@ -1198,27 +983,59 @@ toggleCameraBtn.addEventListener('click', () => {
     stopCamera();
     // ล้างประวัติเมื่อหยุด
     frameHistory.forEach(f => {
-      if (f.frame && !f.frame.isDeleted()) f.frame.delete();
-      if (f.contour && !f.contour.isDeleted()) f.contour.delete();
+      f.frame.delete();
+      f.contour.delete();
     });
     frameHistory = [];
   } else {
     // Reset captured frame when restarting
-    if (capturedFrame && !capturedFrame.isDeleted()) {
+    if (capturedFrame) {
       capturedFrame.delete();
       capturedFrame = null;
     }
-    if (bestContour && !bestContour.isDeleted()) {
+    if (bestContour) {
       bestContour.delete();
       bestContour = null;
     }
-    // Disable download button when restarting
-    downloadImageBtn.disabled = true;
-    downloadImageBtn.style.backgroundColor = '';
-    downloadImageBtn.style.color = '';
     startCamera();
   }
 });
+
+// Crop button - extract card from captured frame
+saveBtn.addEventListener('click', ()=>{
+  if (!capturedFrame || !bestContour) { 
+    alert("No card detected yet. Please capture a card first."); 
+    return; 
+  }
+  
+  // Extract the card region จากภาพต้นฉบับที่ไม่มีกรอบ (capturedFrame)
+  if (bestCropped) bestCropped.delete();
+  bestCropped = extractCardRegion(capturedFrame, bestContour);
+  
+  // Show the cropped and sharpened card (ไม่มีกรอบเขียว)
+  cv.imshow(canvasOutput, bestCropped);
+  logStatus("Card cropped and sharpened! Downloading...");
+  
+  // Auto-download - Create a temporary canvas for clean output
+  setTimeout(() => {
+    // Create a temporary canvas to ensure clean output
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = bestCropped.cols;
+    tempCanvas.height = bestCropped.rows;
+    const tempCtx = tempCanvas.getContext('2d');
+    
+    // Draw the clean cropped image to temp canvas
+    cv.imshow(tempCanvas, bestCropped);
+    
+    // Download from temp canvas
+    const link = document.createElement('a');
+    link.download = 'cropped_card.png';
+    link.href = tempCanvas.toDataURL('image/png', 1.0); // คุณภาพสูงสุด
+    link.click();
+    
+    logStatus("Card saved! Click 'Start Camera' to capture another card.");
+  }, 100);
+});                                                                              
 
 // cleanup when page unloads
 window.addEventListener('unload', ()=>{

@@ -6,7 +6,7 @@ let toggleCameraBtn = document.getElementById('toggleCameraBtn');
 let downloadImageBtn = document.getElementById('downloadImageBtn'); // Add reference to the button
 
 let streaming = false;
-let src = null, gray = null, blurred = null;
+let src = null, gray = null, blurred = null, edges = null;
 let contours = null, hierarchy = null;
 let cap = null;
 let cameraStream = null;
@@ -14,18 +14,9 @@ let isProcessing = false;
 let capturedFrame = null; // Store the captured frame
 let croppedCardImage = null; // Store the cropped card image
 
-// onnxruntime-web session for YOLO
-let ortSession = null;
-let yoloInputShape = [1, 3, 640, 640]; // default, will try to read from model
-let yoloInputName = null;
-let yoloProviders = [];
-const yoloScoreThresh = 0.4;   // confidence threshold for detections
-const yoloNmsIouThresh = 0.45; // NMS IoU threshold
-
 const scoreThreshold = 0.50; // Lower threshold for easier detection
 const sharpnessThreshold = 25; // Lower for more flexibility
 const requiredStableFrames = 10; // Reduce for faster detection
-
 const inFrameThreshold = 0.7;
 let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
@@ -33,11 +24,11 @@ const historySize = 8; // Reduce history size
 
 // Add at top with other variables
 let frameSkipCounter = 0;
-const PROCESS_EVERY_N_FRAMES = 2; // Process every 2nd frame with GPU accel
-let reusableTempCanvas = null; // Reuse canvas
-let yoloCanvas = null; // For letterbox preprocessing
-let toggleBlurWarn = document.getElementById('toggleBlurWarn'); // Add missing reference
+const PROCESS_EVERY_N_FRAMES = 2; // Process every 2nd frame for better performance
+let reusableTempCanvas = null;
+let showCannyMode = false; // Add toggle for Canny visualization
 
+let toggleBlurWarn = document.getElementById('toggleBlurWarn'); // Add missing reference
 
 function logStatus(s){ statusEl.innerText = s; }
 
@@ -49,15 +40,8 @@ function onOpenCvReady() {
     return;
   }
   if (cv.getBuildInformation) {
-    // Kick off YOLO model loading in parallel
-    initYolo().then(() => {
-      logStatus("OpenCV.js + YOLO ready - Click 'Start Camera' to begin");
-      toggleCameraBtn.disabled = false;
-    }).catch(err => {
-      console.error(err);
-      logStatus("OpenCV.js loaded, YOLO failed: " + err);
-      toggleCameraBtn.disabled = false;
-    });
+    logStatus("OpenCV.js loaded - Click 'Start Camera' to begin");
+    toggleCameraBtn.disabled = false;
   } else {
     setTimeout(onOpenCvReady, 100);
   }
@@ -141,6 +125,7 @@ function initializeMats(){
   
   gray = new cv.Mat();
   blurred = new cv.Mat();
+  edges = new cv.Mat();
   contours = new cv.MatVector();
   hierarchy = new cv.Mat();
   
@@ -212,67 +197,54 @@ function detectReflection(frameMatColor, contour) {
   const totalPixels = cv.countNonZero(mask);
   const reflectionRatio = brightPixels / totalPixels;
   
-  // ตรวจจับ spike reflections โดยหา connected components (ทำเมื่อมีแสงจ้าในระดับหนึ่งเพื่อลดภาระ)
+  // ตรวจจับ spike reflections โดยหา connected components
+  const labels = new cv.Mat();
+  const stats = new cv.Mat();
+  const centroids = new cv.Mat();
+  const numLabels = cv.connectedComponentsWithStats(cardRegion, labels, stats, centroids);
+  
   let hasSpikeReflection = false;
   let maxSpikeIntensity = 0;
-  if (reflectionRatio > 0.02) {
-    const labels = new cv.Mat();
-    const stats = new cv.Mat();
-    const centroids = new cv.Mat();
-    const numLabels = cv.connectedComponentsWithStats(cardRegion, labels, stats, centroids);
-
-    // ตรวจสอบแต่ละ component (ข้าม label 0 ซึ่งเป็น background)
-    for (let i = 1; i < numLabels; i++) {
-      const area = stats.intAt(i, cv.CC_STAT_AREA);
-      const x = stats.intAt(i, cv.CC_STAT_LEFT);
-      const y = stats.intAt(i, cv.CC_STAT_TOP);
-      const width = stats.intAt(i, cv.CC_STAT_WIDTH);
-      const height = stats.intAt(i, cv.CC_STAT_HEIGHT);
+  
+  // ตรวจสอบแต่ละ component (ข้าม label 0 ซึ่งเป็น background)
+  for (let i = 1; i < numLabels; i++) {
+    const area = stats.intAt(i, cv.CC_STAT_AREA);
+    const x = stats.intAt(i, cv.CC_STAT_LEFT);
+    const y = stats.intAt(i, cv.CC_STAT_TOP);
+    const width = stats.intAt(i, cv.CC_STAT_WIDTH);
+    const height = stats.intAt(i, cv.CC_STAT_HEIGHT);
+    
+    // คำนวณความเข้มข้นของ spike (area / bounding box)
+    const boundingBoxArea = width * height;
+    const density = area / boundingBoxArea;
+    
+    // Spike reflection = พื้นที่เล็ก (0.1% - 5% ของการ์ด) แต่เข้มข้นสูง (density > 0.3)
+    const minSpikeArea = totalPixels * 0.001;  // 0.1%
+    const maxSpikeArea = totalPixels * 0.05;   // 5%
+    
+    if (area > minSpikeArea && area < maxSpikeArea && density > 0.3) {
+      // ตรวจสอบว่า spike นี้สว่างกว่าค่าเฉลี่ยมากพอหรือไม่
+      const spikeROI = grayLocal.roi(new cv.Rect(x, y, width, height));
+      const spikeMask = labels.roi(new cv.Rect(x, y, width, height));
+      const spikeMaskBinary = new cv.Mat();
+      cv.compare(spikeMask, new cv.Mat(height, width, spikeMask.type(), new cv.Scalar(i)), spikeMaskBinary, cv.CMP_EQ);
       
-      // คำนวณความเข้มข้นของ spike (area / bounding box)
-      const boundingBoxArea = width * height;
-      const density = area / boundingBoxArea;
+      const spikeMean = new cv.Mat();
+      cv.meanStdDev(spikeROI, spikeMean, new cv.Mat(), spikeMaskBinary);
+      const spikeIntensity = spikeMean.doubleAt(0, 0);
       
-      // Spike reflection = พื้นที่เล็ก (0.1% - 5% ของการ์ด) แต่เข้มข้นสูง (density > 0.3)
-      const minSpikeArea = totalPixels * 0.001;  // 0.1%
-      const maxSpikeArea = totalPixels * 0.05;   // 5%
-      
-      if (area > minSpikeArea && area < maxSpikeArea && density > 0.3) {
-        // ตรวจสอบว่า spike นี้สว่างกว่าค่าเฉลี่ยมากพอหรือไม่
-        const spikeROI = grayLocal.roi(new cv.Rect(x, y, width, height));
-        const spikeMask = labels.roi(new cv.Rect(x, y, width, height));
-        const spikeMaskBinary = new cv.Mat();
-        const labelVal = new cv.Mat(height, width, spikeMask.type(), new cv.Scalar(i));
-        cv.compare(spikeMask, labelVal, spikeMaskBinary, cv.CMP_EQ);
-        
-  const spikeMean = new cv.Mat();
-  const spikeStd = new cv.Mat();
-  cv.meanStdDev(spikeROI, spikeMean, spikeStd, spikeMaskBinary);
-        const spikeIntensity = spikeMean.doubleAt(0, 0);
-        
-        // Spike ต้องสว่างกว่าค่าเฉลี่ยอย่างน้อย 40 units
-        if (spikeIntensity - meanBrightness > 40) {
-          hasSpikeReflection = true;
-          maxSpikeIntensity = Math.max(maxSpikeIntensity, spikeIntensity - meanBrightness);
-        }
-        
-        // Cleanup ROI temporaries
-        spikeMaskBinary.delete();
-  spikeMean.delete();
-  spikeStd.delete();
-        spikeROI.delete();
-        spikeMask.delete();
-        labelVal.delete();
+      // Spike ต้องสว่างกว่าค่าเฉลี่ยอย่างน้อย 40 units
+      if (spikeIntensity - meanBrightness > 40) {
+        hasSpikeReflection = true;
+        maxSpikeIntensity = Math.max(maxSpikeIntensity, spikeIntensity - meanBrightness);
       }
+      
+      spikeMaskBinary.delete();
+      spikeMean.delete();
     }
-
-    // cleanup CC mats
-    labels.delete();
-    stats.delete();
-    centroids.delete();
   }
-
-  // cleanup commons
+  
+  // cleanup
   mask.delete();
   contourVec.delete();
   grayLocal.delete();
@@ -281,6 +253,9 @@ function detectReflection(frameMatColor, contour) {
   stddevMat.delete();
   brightThreshold.delete();
   cardRegion.delete();
+  labels.delete();
+  stats.delete();
+  centroids.delete();
   
   // ตรวจพบแสงสะท้อนถ้า:
   // 1. มีพื้นที่สว่างเกินไปมากกว่า 15%
@@ -583,248 +558,7 @@ function displayCroppedCard(imageMat, contour) {
   return false;
 }
 
-// ================== YOLO (ONNX Runtime Web) helpers ==================
-async function initYolo() {
-  if (typeof ort === 'undefined') {
-    throw new Error('onnxruntime-web (ort) not found. Make sure index.html includes it.');
-  }
-  // Pick the fastest available EP: webgpu > webgl > wasm
-  const ep = [];
-  if (navigator.gpu) ep.push('webgpu');
-  // webgl support check
-  const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
-  if (gl) ep.push('webgl');
-  ep.push('wasm');
-  yoloProviders = ep;
-
-  const so = {
-    executionProviders: ep,
-    graphOptimizationLevel: 'all'
-  };
-
-  // Load model from same folder
-  ortSession = await ort.InferenceSession.create('best.onnx', so);
-  yoloInputName = ortSession.inputNames[0];
-
-  try {
-    const meta = ortSession.inputMetadata[yoloInputName];
-    if (meta && Array.isArray(meta.dimensions)) {
-      // Try to parse static dims like [1,3,640,640]; fall back if -1
-      const dims = meta.dimensions.map(d => (typeof d === 'number' && d > 0 ? d : null));
-      if (dims[2] && dims[3]) {
-        yoloInputShape = [1, 3, dims[2], dims[3]];
-      }
-    }
-  } catch(e) {
-    console.warn('Could not read input metadata, using default 640x640');
-  }
-
-  // Prepare preprocessing canvas
-  if (!yoloCanvas) yoloCanvas = document.createElement('canvas');
-  yoloCanvas.width = yoloInputShape[2];
-  yoloCanvas.height = yoloInputShape[3];
-}
-
-function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114,255]) {
-  // Keep aspect ratio by padding
-  const srcW = srcCanvas.width, srcH = srcCanvas.height;
-  const r = Math.min(dstW / srcW, dstH / srcH);
-  const newW = Math.round(srcW * r);
-  const newH = Math.round(srcH * r);
-  const dw = Math.floor((dstW - newW) / 2);
-  const dh = Math.floor((dstH - newH) / 2);
-
-  const ctx = dstCanvas.getContext('2d');
-  // Fill with gray
-  ctx.fillStyle = `rgba(${fill[0]},${fill[1]},${fill[2]},${fill[3]/255})`;
-  ctx.fillRect(0, 0, dstW, dstH);
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
-  return { scale: r, padX: dw, padY: dh, newW, newH };
-}
-
-function preprocessForYolo(srcCanvas) {
-  const [n, c, w, h] = yoloInputShape; // NCHW
-  const info = letterboxToCanvas(srcCanvas, yoloCanvas, w, h);
-  const ctx = yoloCanvas.getContext('2d');
-  const imageData = ctx.getImageData(0, 0, w, h);
-  const data = imageData.data; // RGBA
-  const chw = new Float32Array(n * c * w * h);
-  // Convert to RGB, normalize 0..1, NCHW
-  let p = 0;
-  const wh = w * h;
-  for (let i = 0; i < wh; i++) {
-    const r = data[i * 4] / 255;
-    const g = data[i * 4 + 1] / 255;
-    const b = data[i * 4 + 2] / 255;
-    chw[i] = r;            // R channel
-    chw[i + wh] = g;       // G channel
-    chw[i + 2 * wh] = b;   // B channel
-    p += 3;
-  }
-  const input = new ort.Tensor('float32', chw, [n, c, h, w]);
-  return { input, info };
-}
-
-function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
-
-function xywh2xyxy(x, y, w, h) {
-  const x1 = x - w / 2;
-  const y1 = y - h / 2;
-  const x2 = x + w / 2;
-  const y2 = y + h / 2;
-  return [x1, y1, x2, y2];
-}
-
-function nms(boxes, scores, iouThresh, topK = 100) {
-  const idxs = scores.map((s, i) => [s, i]).sort((a,b)=>b[0]-a[0]).map(v=>v[1]);
-  const picked = [];
-  while (idxs.length) {
-    const i = idxs.shift();
-    picked.push(i);
-    if (picked.length >= topK) break;
-    const rest = [];
-    for (const j of idxs) {
-      const iou = bboxIoU(boxes[i], boxes[j]);
-      if (iou < iouThresh) rest.push(j);
-    }
-    idxs.splice(0, idxs.length, ...rest);
-  }
-  return picked;
-}
-
-function bboxIoU(a, b) {
-  const ax1=a[0], ay1=a[1], ax2=a[2], ay2=a[3];
-  const bx1=b[0], by1=b[1], bx2=b[2], by2=b[3];
-  const interX1 = Math.max(ax1, bx1);
-  const interY1 = Math.max(ay1, by1);
-  const interX2 = Math.min(ax2, bx2);
-  const interY2 = Math.min(ay2, by2);
-  const interW = Math.max(0, interX2 - interX1);
-  const interH = Math.max(0, interY2 - interY1);
-  const interA = interW * interH;
-  const aA = Math.max(0, ax2-ax1) * Math.max(0, ay2-ay1);
-  const bA = Math.max(0, bx2-bx1) * Math.max(0, by2-by1);
-  const union = aA + bA - interA;
-  return union <= 0 ? 0 : interA / union;
-}
-
-function postprocessYolo(output, info, origW, origH) {
-  // Supports common YOLOv5/8 heads
-  // output: ort.Tensor or array of Tensors. We use the first.
-  let outTensor = Array.isArray(output) ? output[0] : output;
-  let data = outTensor.data;
-  const dims = outTensor.dims; // e.g., [1,25200,85] or [1,84,8400]
-
-  const boxes = [];
-  const scores = [];
-  const classes = [];
-
-  // map back to original image coords
-  const gain = info.scale;
-  const padX = info.padX;
-  const padY = info.padY;
-  const inW = yoloInputShape[2];
-  const inH = yoloInputShape[3];
-
-  // Heuristic to detect layout
-  if (dims.length === 3 && dims[2] >= 6 && dims[1] > 1000) {
-    // [1, N, no] with [cx,cy,w,h,obj,cls...]
-    const N = dims[1];
-    const no = dims[2];
-    const numClasses = no - 5;
-    let needSigmoid = false;
-    for (let k = 0; k < Math.min(10, N); k++) {
-      if (data[k*no + 4] > 1) { needSigmoid = true; break; }
-    }
-    for (let i = 0; i < N; i++) {
-      const off = i * no;
-      let cx = data[off + 0];
-      let cy = data[off + 1];
-      let w = data[off + 2];
-      let h = data[off + 3];
-      let obj = data[off + 4];
-      if (needSigmoid) obj = sigmoid(obj);
-      // class probability
-      let best = 0, bestIdx = 0;
-      for (let c = 0; c < numClasses; c++) {
-        let v = data[off + 5 + c];
-        if (needSigmoid) v = sigmoid(v);
-        if (v > best) { best = v; bestIdx = c; }
-      }
-      const conf = obj * (numClasses > 0 ? best : 1);
-      if (conf < yoloScoreThresh) continue;
-      let [x1, y1, x2, y2] = xywh2xyxy(cx, cy, w, h);
-      // Undo letterbox
-      x1 = (x1 - padX) / gain; y1 = (y1 - padY) / gain;
-      x2 = (x2 - padX) / gain; y2 = (y2 - padY) / gain;
-      // Clip
-      x1 = Math.max(0, Math.min(origW-1, x1));
-      y1 = Math.max(0, Math.min(origH-1, y1));
-      x2 = Math.max(0, Math.min(origW-1, x2));
-      y2 = Math.max(0, Math.min(origH-1, y2));
-      boxes.push([x1,y1,x2,y2]);
-      scores.push(conf);
-      classes.push(bestIdx);
-    }
-  } else if (dims.length === 3 && dims[1] >= 6 && dims[2] > 1000) {
-    // [1, no, N] YOLOv8 style, first 4 rows are boxes, remaining are class scores
-    const no = dims[1];
-    const N = dims[2];
-    const numClasses = no - 4;
-    // We may need to apply sigmoid to class probs if >1 detected
-    let needSigmoid = false;
-    for (let k = 0; k < Math.min(10, N); k++) {
-      if (data[4*N + k] > 1) { needSigmoid = true; break; }
-    }
-    for (let i = 0; i < N; i++) {
-      const cx = data[0 * N + i];
-      const cy = data[1 * N + i];
-      const w  = data[2 * N + i];
-      const h  = data[3 * N + i];
-      let best = 0, bestIdx = 0;
-      for (let c = 0; c < numClasses; c++) {
-        let v = data[(4 + c) * N + i];
-        if (needSigmoid) v = sigmoid(v);
-        if (v > best) { best = v; bestIdx = c; }
-      }
-      const conf = best; // v8 often uses class score directly
-      if (conf < yoloScoreThresh) continue;
-      let [x1, y1, x2, y2] = xywh2xyxy(cx, cy, w, h);
-      x1 = (x1 - padX) / gain; y1 = (y1 - padY) / gain;
-      x2 = (x2 - padX) / gain; y2 = (y2 - padY) / gain;
-      x1 = Math.max(0, Math.min(origW-1, x1));
-      y1 = Math.max(0, Math.min(origH-1, y1));
-      x2 = Math.max(0, Math.min(origW-1, x2));
-      y2 = Math.max(0, Math.min(origH-1, y2));
-      boxes.push([x1,y1,x2,y2]);
-      scores.push(conf);
-      classes.push(bestIdx);
-    }
-  } else {
-    console.warn('Unexpected YOLO output dims:', dims);
-  }
-
-  // NMS
-  const keep = nms(boxes, scores, yoloNmsIouThresh, 20);
-  const dets = keep.map(i => ({ box: boxes[i], score: scores[i], cls: classes[i] }));
-  return dets;
-}
-
-async function runYoloOnCanvas(srcCanvas) {
-  if (!ortSession) return [];
-  const { input, info } = preprocessForYolo(srcCanvas);
-  const feeds = {}; feeds[yoloInputName] = input;
-  const output = await ortSession.run(feeds);
-  // Use the first output tensor
-  const first = output[Object.keys(output)[0]];
-  const dets = postprocessYolo(first, info, srcCanvas.width, srcCanvas.height);
-  return dets;
-}
-
-// ----------------- main processing loop -----------------
-async function processVideo(){
+function processVideo(){
   if (!isProcessing) return;
   
   // Skip frames to reduce CPU load
@@ -847,6 +581,42 @@ async function processVideo(){
     if (src && !src.isDeleted()) src.delete();
     src = cv.imread(reusableTempCanvas);
     
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    
+    // Improved preprocessing with bilateral filter for noise reduction while preserving edges
+    const bilateral = new cv.Mat();
+    cv.bilateralFilter(gray, bilateral, 9, 75, 75);
+    
+    // Use adaptive threshold for better edge detection in varying lighting
+    const thresh = new cv.Mat();
+    cv.adaptiveThreshold(bilateral, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 11, 2);
+    
+    // Enhanced Canny edge detection with adjusted thresholds
+    cv.Canny(bilateral, edges, 15, 45, 3, false);
+    
+    // Enhanced morphological operations for better edge connectivity
+    const kernel1 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
+    const kernel2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+
+    cv.morphologyEx(edges, edges, cv.MORPH_CLOSE, kernel1, new cv.Point(-1, -1), 2);
+    cv.dilate(edges, edges, kernel2, new cv.Point(-1, -1), 1);
+    cv.erode(edges, edges, kernel2, new cv.Point(-1, -1), 1);
+
+    // Clear previous contours
+    if (contours && !contours.isDeleted()) {
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        if (cnt && !cnt.isDeleted()) cnt.delete();
+      }
+      contours.delete();
+    }
+    contours = new cv.MatVector();
+    
+    if (hierarchy && !hierarchy.isDeleted()) hierarchy.delete();
+    hierarchy = new cv.Mat();
+
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
     let display = src.clone();
     
     // Show Canny edges if enabled (press 'C' key to toggle)
@@ -892,36 +662,68 @@ async function processVideo(){
                new cv.Point(guideX + 10, guideY - 10),
                cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(100, 100, 100, 255), 2);
 
-    // === YOLO detection instead of Canny/contours ===
-    let detections = [];
-    if (ortSession) {
-      // Run YOLO (await inside try)
-      detections = await runYoloOnCanvas(reusableTempCanvas);
+    let bestLocalScore = 0, bestLocalContour = null;
+    let totalContours = contours.size();
+    let validContours = 0;
+    let fourPointContours = 0;
+    
+    // Improved contour filtering with proper memory management
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      if (!cnt || cnt.isDeleted()) continue;
+      
+      const area = cv.contourArea(cnt);
+      const frameArea = src.rows * src.cols;
+      
+      if (area < frameArea * 0.01 || area > frameArea * 0.9) {
+        continue;
+      }
+      
+      validContours++;
+      
+      const peri = cv.arcLength(cnt, true);
+      const approx = new cv.Mat();
+      
+      try {
+        cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+        
+        if (approx.rows === 4) {
+          fourPointContours++;
+          
+          const rect = cv.boundingRect(approx);
+          const aspect = rect.width / rect.height;
+          
+          if (0.2 < aspect && aspect < 5.0) {
+            const score = calculateCardScore(approx, {width: src.cols, height: src.rows});
+            if (score > bestLocalScore) {
+              bestLocalScore = score;
+              if (bestLocalContour && !bestLocalContour.isDeleted()) {
+                bestLocalContour.delete();
+              }
+              bestLocalContour = approx.clone();
+            }
+            
+            if (showCannyMode) {
+              const debugContourVec = new cv.MatVector();
+              debugContourVec.push_back(approx);
+              cv.drawContours(display, debugContourVec, 0, new cv.Scalar(255, 255, 0, 255), 1);
+              debugContourVec.delete();
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('Error processing contour:', error);
+      }
+      
+      if (approx && !approx.isDeleted()) approx.delete();
     }
 
-    // Pick best detection
-    if (detections.length > 0) {
-      // Highest confidence
-      detections.sort((a,b)=>b.score-a.score);
-      const det = detections[0];
-      const [x1,y1,x2,y2] = det.box;
+    // Add debug information
+    cv.putText(display, `Contours: ${totalContours} | Valid: ${validContours} | 4-Point: ${fourPointContours}`, 
+               new cv.Point(10, display.rows - 50), cv.FONT_HERSHEY_SIMPLEX, 0.5, new cv.Scalar(255, 255, 255, 255), 1);
 
-      // Build a 4-point rectangle contour
-      const bestLocalContour = new cv.Mat(4,1,cv.CV_32SC2);
-      // top-left
-      bestLocalContour.intPtr(0,0)[0] = Math.round(x1);
-      bestLocalContour.intPtr(0,0)[1] = Math.round(y1);
-      // top-right
-      bestLocalContour.intPtr(1,0)[0] = Math.round(x2);
-      bestLocalContour.intPtr(1,0)[1] = Math.round(y1);
-      // bottom-right
-      bestLocalContour.intPtr(2,0)[0] = Math.round(x2);
-      bestLocalContour.intPtr(2,0)[1] = Math.round(y2);
-      // bottom-left
-      bestLocalContour.intPtr(3,0)[0] = Math.round(x1);
-      bestLocalContour.intPtr(3,0)[1] = Math.round(y2);
-
-      const score = calculateCardScore(bestLocalContour, {width: src.cols, height: src.rows});
+    if (bestLocalContour && !bestLocalContour.isDeleted()) {
+      const score = bestLocalScore;
       
       // Only draw contours when Canny mode is enabled
       if (showCannyMode) {
@@ -1022,8 +824,6 @@ async function processVideo(){
           isProcessing = false;
           stopCamera();
           
-          const displayFrame = capturedFrame.clone();
-          // Draw nothing on final capture; keep clean
           console.log('Attempting to display cropped card...');
           
           // Display cropped card instead of full frame
@@ -1059,10 +859,9 @@ async function processVideo(){
         }
       }
 
-      // Draw detection rectangle
-      const rectColor = new cv.Scalar(0, 255, 0, 255);
-      cv.rectangle(display, new cv.Point(Math.round(x1), Math.round(y1)), new cv.Point(Math.round(x2), Math.round(y2)), rectColor, 2);
-      bestLocalContour.delete();
+      if (bestLocalContour && !bestLocalContour.isDeleted()) {
+        bestLocalContour.delete();
+      }
     } else {
       stableCount = 0;
       frameHistory.forEach(f => {
@@ -1077,7 +876,13 @@ async function processVideo(){
     }
 
     cv.imshow(canvasOutput, display);
-    display.delete();
+    
+    // Cleanup temporary matrices
+    if (display && !display.isDeleted()) display.delete();
+    if (bilateral && !bilateral.isDeleted()) bilateral.delete();
+    if (thresh && !thresh.isDeleted()) thresh.delete();
+    if (kernel1 && !kernel1.isDeleted()) kernel1.delete();
+    if (kernel2 && !kernel2.isDeleted()) kernel2.delete();
 
   } catch (err){
     console.error('Processing error:', err);
@@ -1224,13 +1029,23 @@ toggleCameraBtn.addEventListener('click', () => {
 window.addEventListener('unload', ()=>{
   stopCamera();
   try {
-    if (src) src.delete();
-    if (gray) gray.delete();
-    if (blurred) blurred.delete();
-    if (contours) contours.delete();
-    if (hierarchy) hierarchy.delete();
-    if (bestContour) bestContour.delete();
-    if (bestCropped) bestCropped.delete();
-    if (cap) cap.delete();
-  } catch(e){}
+    if (src && !src.isDeleted()) src.delete();
+    if (gray && !gray.isDeleted()) gray.delete();
+    if (blurred && !blurred.isDeleted()) blurred.delete();
+    if (edges && !edges.isDeleted()) edges.delete();
+    if (contours && !contours.isDeleted()) {
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        if (cnt && !cnt.isDeleted()) cnt.delete();
+      }
+      contours.delete();
+    }
+    if (hierarchy && !hierarchy.isDeleted()) hierarchy.delete();
+    if (bestContour && !bestContour.isDeleted()) bestContour.delete();
+    if (cap && !cap.isDeleted()) cap.delete();
+    if (croppedCardImage && !croppedCardImage.isDeleted()) croppedCardImage.delete();
+    if (capturedFrame && !capturedFrame.isDeleted()) capturedFrame.delete();
+  } catch(e){
+    console.warn('Cleanup error:', e);
+  }
 });

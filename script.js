@@ -37,6 +37,14 @@ let PROCESS_EVERY_N_FRAMES = 2; // adaptive; will tune for mobile
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
 
+// Worker-based YOLO offload
+let yoloWorker = null;
+let yoloWorkerReady = false;
+let yoloRequestInFlight = false;
+let lastDetections = [];
+let lastYoloMs = 0;
+let modelPath = null; // auto-chosen model
+
 // Simple mobile detection + capabilities
 function isMobile() {
   const ua = navigator.userAgent || navigator.vendor || window.opera;
@@ -246,7 +254,7 @@ function detectReflection(frameMatColor, contour) {
   // ตรวจจับ spike reflections โดยหา connected components (ทำเมื่อมีแสงจ้าในระดับหนึ่งเพื่อลดภาระ)
   let hasSpikeReflection = false;
   let maxSpikeIntensity = 0;
-  if (reflectionRatio > 0.02) {
+  if (reflectionRatio > 0.05) {
     const labels = new cv.Mat();
     const stats = new cv.Mat();
     const centroids = new cv.Mat();
@@ -528,19 +536,70 @@ function extractCardRegion(frameMat, contour){
 
 // ================== YOLO (ONNX Runtime Web) helpers ==================
 async function initYolo() {
+  // Choose model path (faster on mobile by default)
+  modelPath = isMobile() ? 'best480.onnx' : 'best640.onnx';
+
+  // Try to init Web Worker first for multi-thread speedup
+  try {
+    yoloWorker = new Worker('yoloWorker.js');
+  const allowWebGPU = !isMobile() && !!navigator.gpu;
+  // Use a single WASM thread unless COOP/COEP enabled (crossOriginIsolated)
+  const coi = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated);
+  const numThreads = coi ? Math.min(4, (navigator.hardwareConcurrency || 4)) : 1;
+    const readyPromise = new Promise((resolve, reject) => {
+      const onMsg = (ev) => {
+        const m = ev.data;
+        if (!m || !m.type) return;
+        if (m.type === 'ready') {
+          yoloWorkerReady = true;
+          if (m.inputShape) yoloInputShape = m.inputShape;
+          resolve();
+        } else if (m.type === 'error') {
+          reject(new Error(m.error || 'Worker init error'));
+        }
+      };
+      yoloWorker.addEventListener('message', onMsg, { once: true });
+      yoloWorker.postMessage({
+        type: 'init',
+        allowWebGPU,
+        numThreads,
+        scoreThresh: yoloScoreThresh,
+        nmsIouThresh: yoloNmsIouThresh,
+        modelPath
+      });
+    });
+    await readyPromise;
+    // Hook continuous result listener
+    yoloWorker.addEventListener('message', (ev) => {
+      const m = ev.data || {};
+      if (m.type === 'result') {
+        lastDetections = m.dets || [];
+        lastYoloMs = m.timeMs || 0;
+        yoloRequestInFlight = false;
+      } else if (m.type === 'error') {
+        console.warn('YOLO worker error:', m.error);
+        yoloRequestInFlight = false;
+      }
+    });
+    return; // Worker ready, skip main-thread ORT init
+  } catch (e) {
+    console.warn('YOLO worker failed, falling back to main thread:', e);
+  }
+
+  // Fallback: init ORT on main thread
   if (typeof ort === 'undefined') {
     throw new Error('onnxruntime-web (ort) not found. Make sure index.html includes it.');
   }
-  // Configure WASM env before creating session
   try {
     if (ort.env && ort.env.wasm) {
-      ort.env.wasm.simd = true; // enable SIMD if available
-      // Fewer threads on mobile to avoid UI jank
-      ort.env.wasm.numThreads = isMobile() ? 1 : Math.min(4, (navigator.hardwareConcurrency || 4));
+      // Ensure ORT loads wasm assets from CDN when needed
+      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+      ort.env.wasm.simd = true;
+      const coi = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated);
+      ort.env.wasm.numThreads = coi ? Math.min(4, (navigator.hardwareConcurrency || 4)) : 1;
     }
   } catch (e) { /* ignore */ }
 
-  // Pick optimal EPs. On mobile prefer webgl -> wasm (WebGPU still young on mobile)
   const ep = [];
   const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
   const mobile = isMobile();
@@ -549,35 +608,20 @@ async function initYolo() {
   ep.push('wasm');
   yoloProviders = ep;
 
-  const so = {
-    executionProviders: ep,
-    graphOptimizationLevel: 'all'
-  };
-
-  // Load model from same folder
-  ortSession = await ort.InferenceSession.create('best640.onnx', so);
+  const so = { executionProviders: ep, graphOptimizationLevel: 'all' };
+  ortSession = await ort.InferenceSession.create(modelPath, so);
   yoloInputName = ortSession.inputNames[0];
-
   try {
     const meta = ortSession.inputMetadata[yoloInputName];
     if (meta && Array.isArray(meta.dimensions)) {
-      // Try to parse static dims like [1,3,640,640]; fall back if -1
       const dims = meta.dimensions.map(d => (typeof d === 'number' && d > 0 ? d : null));
-      if (dims[2] && dims[3]) {
-        yoloInputShape = [1, 3, dims[2], dims[3]];
-      }
+      if (dims[2] && dims[3]) yoloInputShape = [1, 3, dims[2], dims[3]];
     }
-  } catch(e) {
-    console.warn('Could not read input metadata, using default 640x640');
-  }
+  } catch(e) { console.warn('Could not read input metadata, using default 640x640'); }
 
-  // Prepare preprocessing canvas (OffscreenCanvas on supported browsers)
   if (!yoloCanvas) {
-    if (typeof OffscreenCanvas !== 'undefined') {
-      yoloCanvas = new OffscreenCanvas(yoloInputShape[2], yoloInputShape[3]);
-    } else {
-      yoloCanvas = document.createElement('canvas');
-    }
+    if (typeof OffscreenCanvas !== 'undefined') yoloCanvas = new OffscreenCanvas(yoloInputShape[2], yoloInputShape[3]);
+    else yoloCanvas = document.createElement('canvas');
   }
   yoloCanvas.width = yoloInputShape[2];
   yoloCanvas.height = yoloInputShape[3];
@@ -592,7 +636,7 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
   const dw = Math.floor((dstW - newW) / 2);
   const dh = Math.floor((dstH - newH) / 2);
 
-  const ctx = dstCanvas.getContext('2d');
+  const ctx = dstCanvas.getContext('2d', { willReadFrequently: true });
   // Fill with gray
   ctx.fillStyle = `rgba(${fill[0]},${fill[1]},${fill[2]},${fill[3]/255})`;
   ctx.fillRect(0, 0, dstW, dstH);
@@ -606,7 +650,7 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
 function preprocessForYolo(srcCanvas) {
   const [n, c, w, h] = yoloInputShape; // NCHW
   const info = letterboxToCanvas(srcCanvas, yoloCanvas, w, h);
-  const ctx = yoloCanvas.getContext('2d');
+  const ctx = yoloCanvas.getContext('2d', { willReadFrequently: true });
   const imageData = ctx.getImageData(0, 0, w, h);
   const data = imageData.data; // RGBA
   const chw = new Float32Array(n * c * w * h);
@@ -772,6 +816,22 @@ function postprocessYolo(output, info, origW, origH) {
 }
 
 async function runYoloOnCanvas(srcCanvas) {
+  if (yoloWorkerReady) {
+    // If worker is ready, prefer it (non-blocking). Only send if no request in flight.
+    if (!yoloRequestInFlight) {
+      try {
+        const bitmap = await createImageBitmap(srcCanvas);
+        yoloRequestInFlight = true;
+        yoloWorker.postMessage({ type: 'detect', bitmap, origW: srcCanvas.width, origH: srcCanvas.height }, [bitmap]);
+      } catch (e) {
+        // ignore send errors, will fallback to lastDetections
+        yoloRequestInFlight = false;
+      }
+    }
+    // Return last known detections immediately
+    return lastDetections || [];
+  }
+
   if (!ortSession) return [];
   const { input, info } = preprocessForYolo(srcCanvas);
   const feeds = {}; feeds[yoloInputName] = input;
@@ -801,7 +861,7 @@ async function processVideo(){
     }
     reusableTempCanvas.width = video.videoWidth;
     reusableTempCanvas.height = video.videoHeight;
-    const tempCtx = reusableTempCanvas.getContext('2d');
+  const tempCtx = reusableTempCanvas.getContext('2d', { willReadFrequently: true });
     tempCtx.drawImage(video, 0, 0, reusableTempCanvas.width, reusableTempCanvas.height);
     
     if (src) src.delete();
@@ -842,8 +902,13 @@ async function processVideo(){
 
     // === YOLO detection instead of Canny/contours ===
     let detections = [];
-    if (ortSession) {
-      // Run YOLO (await inside try)
+    // Run YOLO (non-blocking via worker if available)
+    if (yoloWorkerReady) {
+      // Fire off detection if none in-flight, but don't await
+      runYoloOnCanvas(reusableTempCanvas);
+      detections = lastDetections || [];
+    } else {
+      // Fallback: run on main thread and await
       detections = await runYoloOnCanvas(reusableTempCanvas);
     }
 
@@ -1033,6 +1098,12 @@ async function processVideo(){
     } else if (dt < 60 && PROCESS_EVERY_N_FRAMES > 1) {
       PROCESS_EVERY_N_FRAMES--;
     }
+    // Lightweight FPS status
+    const fps = (1000 / (dt || 16.7)).toFixed(1);
+    if (statusEl) {
+      const base = streaming ? 'Camera started' : statusEl.innerText.split(' | ')[0];
+      statusEl.innerText = `${base} | FPS ~ ${fps}${lastYoloMs?` | YOLO ${lastYoloMs.toFixed(0)}ms`:''}`;
+    }
     scheduleNextFrame(processVideo);
   }
 }
@@ -1109,6 +1180,7 @@ window.addEventListener('unload', ()=>{
     if (bestContour) bestContour.delete();
     if (bestCropped) bestCropped.delete();
     if (cap) cap.delete();
+    if (yoloWorker) { yoloWorker.terminate(); yoloWorker = null; }
   } catch(e){}
 });
 

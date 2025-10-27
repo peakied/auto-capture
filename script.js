@@ -33,9 +33,24 @@ const historySize = 10; // Increase history size to capture more frames
 
 // Add at top with other variables
 let frameSkipCounter = 0;
-const PROCESS_EVERY_N_FRAMES = 2; // Process every 2nd frame with GPU accel
+let PROCESS_EVERY_N_FRAMES = 2; // adaptive; will tune for mobile
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
+
+// Simple mobile detection + capabilities
+function isMobile() {
+  const ua = navigator.userAgent || navigator.vendor || window.opera;
+  return /android|iphone|ipad|ipod|iemobile|mobile/i.test(ua);
+}
+
+// Frame scheduler using requestVideoFrameCallback when available
+function scheduleNextFrame(cb) {
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    video.requestVideoFrameCallback(() => cb());
+  } else {
+    requestAnimationFrame(cb);
+  }
+}
 
 function logStatus(s){ statusEl.innerText = s; }
 
@@ -72,14 +87,29 @@ if (document.readyState === 'loading') {
 
 async function startCamera() {
   try {
-    cameraStream = await navigator.mediaDevices.getUserMedia({ 
-      video: {
-        width: { ideal: 1280 }, // Request higher resolution for better detection
-        height: { ideal: 720 },
-        facingMode: "environment"
-      }, 
-      audio: false 
-    });
+    // Pick constraints suited for device
+    const mobile = isMobile();
+    const constraints = mobile
+      ? {
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280, max: 1280 },
+            height: { ideal: 720, max: 720 },
+            frameRate: { ideal: 30, max: 30 }
+          },
+          audio: false
+        }
+      : {
+          video: {
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: "environment",
+            frameRate: { ideal: 30 }
+          },
+          audio: false
+        };
+
+    cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
     video.srcObject = cameraStream;
     video.play();
     video.onloadedmetadata = () => {
@@ -95,8 +125,12 @@ async function startCamera() {
             }
             initializeMats();
             isProcessing = true;
+            // Slightly higher skip on mobile to save CPU/GPU
+            if (isMobile()) {
+              PROCESS_EVERY_N_FRAMES = 3;
+            }
             // Give one more frame delay before processing
-            setTimeout(() => requestAnimationFrame(processVideo), 100);
+            setTimeout(() => scheduleNextFrame(processVideo), 100);
         }, 200);
     };
     streaming = true;
@@ -497,11 +531,20 @@ async function initYolo() {
   if (typeof ort === 'undefined') {
     throw new Error('onnxruntime-web (ort) not found. Make sure index.html includes it.');
   }
-  // Pick the fastest available EP: webgpu > webgl > wasm
+  // Configure WASM env before creating session
+  try {
+    if (ort.env && ort.env.wasm) {
+      ort.env.wasm.simd = true; // enable SIMD if available
+      // Fewer threads on mobile to avoid UI jank
+      ort.env.wasm.numThreads = isMobile() ? 1 : Math.min(4, (navigator.hardwareConcurrency || 4));
+    }
+  } catch (e) { /* ignore */ }
+
+  // Pick optimal EPs. On mobile prefer webgl -> wasm (WebGPU still young on mobile)
   const ep = [];
-  if (navigator.gpu) ep.push('webgpu');
-  // webgl support check
   const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
+  const mobile = isMobile();
+  if (!mobile && navigator.gpu) ep.push('webgpu');
   if (gl) ep.push('webgl');
   ep.push('wasm');
   yoloProviders = ep;
@@ -528,8 +571,14 @@ async function initYolo() {
     console.warn('Could not read input metadata, using default 640x640');
   }
 
-  // Prepare preprocessing canvas
-  if (!yoloCanvas) yoloCanvas = document.createElement('canvas');
+  // Prepare preprocessing canvas (OffscreenCanvas on supported browsers)
+  if (!yoloCanvas) {
+    if (typeof OffscreenCanvas !== 'undefined') {
+      yoloCanvas = new OffscreenCanvas(yoloInputShape[2], yoloInputShape[3]);
+    } else {
+      yoloCanvas = document.createElement('canvas');
+    }
+  }
   yoloCanvas.width = yoloInputShape[2];
   yoloCanvas.height = yoloInputShape[3];
 }
@@ -547,8 +596,9 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
   // Fill with gray
   ctx.fillStyle = `rgba(${fill[0]},${fill[1]},${fill[2]},${fill[3]/255})`;
   ctx.fillRect(0, 0, dstW, dstH);
+  // Favor speed on mobile
   ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
+  ctx.imageSmoothingQuality = isMobile() ? 'low' : 'high';
   ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
   return { scale: r, padX: dw, padY: dh, newW, newH };
 }
@@ -739,11 +789,12 @@ async function processVideo(){
   // Skip frames to reduce CPU load
   frameSkipCounter++;
   if (frameSkipCounter % PROCESS_EVERY_N_FRAMES !== 0) {
-    requestAnimationFrame(processVideo);
+    scheduleNextFrame(processVideo);
     return;
   }
   
   try {
+    const t0 = performance.now();
     // Reuse canvas instead of creating new one
     if (!reusableTempCanvas) {
       reusableTempCanvas = document.createElement('canvas');
@@ -973,7 +1024,16 @@ async function processVideo(){
   }
 
   if (isProcessing) {
-    requestAnimationFrame(processVideo); // Remove setTimeout, use requestAnimationFrame directly
+    // Adaptive frame skipping based on processing time
+    const t1 = performance.now();
+    const dt = t1 - (window.__lastFrameT || t1);
+    window.__lastFrameT = t1;
+    if (dt > 120 && PROCESS_EVERY_N_FRAMES < 4) {
+      PROCESS_EVERY_N_FRAMES++;
+    } else if (dt < 60 && PROCESS_EVERY_N_FRAMES > 1) {
+      PROCESS_EVERY_N_FRAMES--;
+    }
+    scheduleNextFrame(processVideo);
   }
 }
 
@@ -1050,4 +1110,14 @@ window.addEventListener('unload', ()=>{
     if (bestCropped) bestCropped.delete();
     if (cap) cap.delete();
   } catch(e){}
+});
+
+// Pause processing when tab is hidden to save battery
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    isProcessing = false;
+  } else if (streaming && !isProcessing) {
+    isProcessing = true;
+    scheduleNextFrame(processVideo);
+  }
 });

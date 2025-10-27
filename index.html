@@ -11,8 +11,12 @@
   
   <style>
     body { font-family: Arial, sans-serif; display:flex; gap:16px; padding:12px; }
-    #video, #canvasOutput { max-height:480px; border:1px solid #ccc; }
+    #video, #canvasOutput { max-height:480px; border:1px solid #ccc; max-width:100%; height:auto; }
     #controls { display:flex; flex-direction:column; gap:8px; }
+    @media (max-width: 900px) {
+      body { flex-direction: column; align-items: stretch; }
+      #video, #canvasOutput { width: 100%; max-height: unset; }
+    }
   </style>
 </head>
 <body>

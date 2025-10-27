@@ -17,7 +17,7 @@ let capturedFrame = null; // Store the captured frame
 
 // onnxruntime-web session for YOLO
 let ortSession = null;
-let yoloInputShape = [1, 3, 480, 480]; // default, will try to read from model
+let yoloInputShape = [1, 3, 640, 640]; // default, will try to read from model
 let yoloInputName = null;
 let yoloProviders = [];
 const yoloScoreThresh = 0.4;   // confidence threshold for detections
@@ -555,7 +555,7 @@ async function initYolo() {
   };
 
   // Load model from same folder
-  ortSession = await ort.InferenceSession.create('best.onnx', so);
+  ortSession = await ort.InferenceSession.create('best640.onnx', so);
   yoloInputName = ortSession.inputNames[0];
 
   try {

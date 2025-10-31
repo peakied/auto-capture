@@ -33,7 +33,11 @@ const historySize = 10; // Increase history size to capture more frames
 
 // Add at top with other variables
 let frameSkipCounter = 0;
-let PROCESS_EVERY_N_FRAMES = 2; // adaptive; will tune for mobile
+// Add target FPS for both video and YOLO, and track last YOLO time
+const TARGET_FPS = 15;
+let lastYoloTimestamp = 0;
+// Process every captured frame (camera will be requested at TARGET_FPS)
+let PROCESS_EVERY_N_FRAMES = 1; // adaptive; will tune for mobile
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
 
@@ -103,7 +107,7 @@ async function startCamera() {
             facingMode: { ideal: "environment" },
             width: { ideal: 1280, max: 1280 },
             height: { ideal: 720, max: 720 },
-            frameRate: { ideal: 30, max: 30 }
+            frameRate: { ideal: TARGET_FPS, max: TARGET_FPS }
           },
           audio: false
         }
@@ -112,7 +116,7 @@ async function startCamera() {
             width: { ideal: 1280 },
             height: { ideal: 720 },
             facingMode: "environment",
-            frameRate: { ideal: 30 }
+            frameRate: { ideal: TARGET_FPS, max: TARGET_FPS }
           },
           audio: false
         };
@@ -135,7 +139,7 @@ async function startCamera() {
             isProcessing = true;
             // Slightly higher skip on mobile to save CPU/GPU
             if (isMobile()) {
-              PROCESS_EVERY_N_FRAMES = 3;
+              PROCESS_EVERY_N_FRAMES = 1;
             }
             // Give one more frame delay before processing
             setTimeout(() => scheduleNextFrame(processVideo), 100);
@@ -816,6 +820,16 @@ function postprocessYolo(output, info, origW, origH) {
 }
 
 async function runYoloOnCanvas(srcCanvas) {
+  // Throttle YOLO to TARGET_FPS (works for worker and main-thread)
+  const now = performance.now();
+  const minInterval = 1000 / TARGET_FPS;
+  if (now - lastYoloTimestamp < minInterval) {
+    // Too soon to run a new YOLO; return last known detections
+    return lastDetections || [];
+  }
+  // Reserve the timestamp immediately to prevent overlapping launches
+  lastYoloTimestamp = now;
+
   if (yoloWorkerReady) {
     // If worker is ready, prefer it (non-blocking). Only send if no request in flight.
     if (!yoloRequestInFlight) {

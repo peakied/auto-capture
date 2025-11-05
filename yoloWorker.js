@@ -151,14 +151,14 @@ self.onmessage = async (ev) => {
     if (msg.type === 'init') {
       // Load ORT from CDN in worker
       if (!ortLoaded) {
-        importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js');
+        importScripts('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/ort.min.js');
         ortLoaded = true;
       }
       // Configure WASM env if available
       try {
         if (self.ort && self.ort.env && self.ort.env.wasm) {
           // Ensure assets load from CDN instead of page origin
-          self.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+          self.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/';
           self.ort.env.wasm.simd = true;
           // Use 1 thread unless cross-origin isolation is enabled
           const coi = (typeof self.crossOriginIsolated !== 'undefined' && self.crossOriginIsolated);

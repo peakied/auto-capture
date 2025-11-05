@@ -593,7 +593,7 @@ async function initYolo() {
   try {
     if (ort.env && ort.env.wasm) {
       // Ensure ORT loads wasm assets from CDN when needed
-      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+      ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/';
       ort.env.wasm.simd = true;
       const coi = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated);
       ort.env.wasm.numThreads = coi ? Math.min(4, (navigator.hardwareConcurrency || 4)) : 1;

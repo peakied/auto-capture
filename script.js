@@ -46,6 +46,17 @@ let lastDetections = [];
 let lastYoloMs = 0;
 let modelPath = null; // auto-chosen model
 
+// Lightweight profiling toggles/holders
+let PROFILE = true; // set false to disable timing updates
+let lastProfile = {
+  grabMs: 0,
+  yoloMs: 0,
+  sharpMs: 0,
+  reflMs: 0,
+  drawMs: 0,
+  totalMs: 0
+};
+
 // Simple mobile detection + capabilities
 function isMobile() {
   const ua = navigator.userAgent || navigator.vendor || window.opera;
@@ -639,7 +650,7 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
   // Favor speed on mobile
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = isMobile() ? 'low' : 'high';
-  ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
+  // ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
   return { scale: r, padX: dw, padY: dh, newW, newH };
 }
 
@@ -805,9 +816,12 @@ async function runYoloOnCanvas(srcCanvas) {
   }
 
   if (!ortSession) return [];
+  const y0 = performance.now();
   const { input, info } = preprocessForYolo(srcCanvas);
   const feeds = {}; feeds[yoloInputName] = input;
   const output = await ortSession.run(feeds);
+  const y1 = performance.now();
+  lastYoloMs = y1 - y0;
   // Use the first output tensor
   const first = output[Object.keys(output)[0]];
   // Debug dims and sample values to help diagnose tiny-model issues
@@ -833,23 +847,23 @@ async function processVideo(){
   }
   
   try {
-    const t0 = performance.now();
+    const tFrame0 = performance.now();
     // Reuse canvas instead of creating new one
     if (!reusableTempCanvas) {
       reusableTempCanvas = document.createElement('canvas');
     }
     reusableTempCanvas.width = video.videoWidth;
     reusableTempCanvas.height = video.videoHeight;
-  const tempCtx = reusableTempCanvas.getContext('2d', { willReadFrequently: true });
+    const tempCtx = reusableTempCanvas.getContext('2d', { willReadFrequently: true });
     tempCtx.drawImage(video, 0, 0, reusableTempCanvas.width, reusableTempCanvas.height);
-    
-    if (src) src.delete();
-    src = cv.imread(reusableTempCanvas);
-    
-    let display = src.clone();
-    
-    const frameW = src.cols;
-    const frameH = src.rows;
+
+    // Draw base frame to output using Canvas 2D (avoid cv.imread for most frames)
+    const outCtx = canvasOutput.getContext('2d');
+    const tAfterGrab = performance.now();
+    outCtx.drawImage(reusableTempCanvas, 0, 0);
+
+    const frameW = reusableTempCanvas.width;
+    const frameH = reusableTempCanvas.height;
     const card_ratio = 86 / 54;
     
     let guideWidth = Math.floor(frameW * 0.7);
@@ -870,14 +884,13 @@ async function processVideo(){
       height: guideHeight
     };
     
-    // วาดกรอบอ้างอิง
-    cv.rectangle(display, 
-                new cv.Point(guideX, guideY),
-                new cv.Point(guideX + guideWidth, guideY + guideHeight),
-                new cv.Scalar(100, 100, 100, 255), 2);
-    cv.putText(display, "Align card here", 
-               new cv.Point(guideX + 10, guideY - 10),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(100, 100, 100, 255), 2);
+  // Draw guide box and hint text with Canvas 2D
+  outCtx.strokeStyle = 'rgb(100,100,100)';
+  outCtx.lineWidth = 2;
+  outCtx.strokeRect(guideX, guideY, guideWidth, guideHeight);
+  outCtx.fillStyle = 'rgb(100,100,100)';
+  outCtx.font = '16px sans-serif';
+  outCtx.fillText('Align card here', guideX + 10, Math.max(20, guideY - 10));
 
     // === YOLO detection instead of Canny/contours ===
     let detections = [];
@@ -890,8 +903,9 @@ async function processVideo(){
       // Fallback: run on main thread and await
       detections = await runYoloOnCanvas(reusableTempCanvas);
     }
+    const tAfterYolo = performance.now();
 
-    // Pick best detection
+  // Pick best detection
     if (detections.length > 0) {
       // Highest confidence
       detections.sort((a,b)=>b.score-a.score);
@@ -913,19 +927,27 @@ async function processVideo(){
       bestLocalContour.intPtr(3,0)[0] = Math.round(x1);
       bestLocalContour.intPtr(3,0)[1] = Math.round(y2);
 
-      const score = calculateCardScore(bestLocalContour, {width: src.cols, height: src.rows});
+  const score = calculateCardScore(bestLocalContour, {width: frameW, height: frameH});
       
       // Only calculate sharpness if score is good enough
       let sharpness = 0;
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
       
+      let srcMatForThisFrame = null;
       if (score > scoreThreshold - 0.1) { // Pre-filter by score
-        sharpness = calculateSharpness(src, bestLocalContour);
+        // Only create OpenCV Mat when needed (lazy)
+        srcMatForThisFrame = cv.imread(reusableTempCanvas);
+        const tS0 = performance.now();
+        sharpness = calculateSharpness(srcMatForThisFrame, bestLocalContour);
+        const tS1 = performance.now();
+        if (PROFILE) lastProfile.sharpMs = tS1 - tS0;
         const isSharp = sharpness >= sharpnessThreshold;
-        
         // Only check reflection if sharp enough
         if (isSharp) {
-          reflectionData = detectReflection(src, bestLocalContour);
+          const tR0 = performance.now();
+          reflectionData = detectReflection(srcMatForThisFrame, bestLocalContour);
+          const tR1 = performance.now();
+          if (PROFILE) lastProfile.reflMs = tR1 - tR0;
         }
       }
       
@@ -943,22 +965,27 @@ async function processVideo(){
       // cv.drawContours(display, contourVec, 0, color, 2);
       // contourVec.delete();
 
-      const color = isGood ? new cv.Scalar(0,255,0,255) : 
-                    inFrame ? new cv.Scalar(0,165,255,255) : 
-                    new cv.Scalar(255,0,0,255);
-
-      cv.putText(display, `Score: ${score.toFixed(2)}`, new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.9, color,2);
-      cv.putText(display, `Sharp: ${sharpness.toFixed(1)}`, new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(isSharp?0:255, isSharp?255:0, 0,255),2);
-      cv.putText(display, `In Frame: ${inFrame?'YES':'NO'}`, new cv.Point(10,90), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(inFrame?0:255, inFrame?255:0, 0,255),2);
-      cv.putText(display, `Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, new cv.Point(10,120), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(hasReflection?255:0, hasReflection?0:255, 0,255),2);
+  // Colors
+  const colorStr = isGood ? 'rgb(0,255,0)' : (inFrame ? 'rgb(255,165,0)' : 'rgb(255,0,0)');
+  outCtx.fillStyle = colorStr;
+  outCtx.font = '18px sans-serif';
+  outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
+  outCtx.fillStyle = (isSharp ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
+  outCtx.font = '16px sans-serif';
+  outCtx.fillText(`Sharp: ${sharpness.toFixed(1)}`, 10, 60);
+  outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
+  outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 90);
+  outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
+  outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 120);
 
       if (isGood) {
         // Calculate quality score for comparison
         const qualityScore = calculateQualityScore(score, sharpness, reflectionData.reflectionRatio);
         
-        // Store frame with quality score
+        // Store frame with quality score (ensure we have a Mat)
+        if (!srcMatForThisFrame) srcMatForThisFrame = cv.imread(reusableTempCanvas);
         frameHistory.push({
-          frame: src.clone(),
+          frame: srcMatForThisFrame.clone(),
           contour: bestLocalContour.clone(),
           score: score,
           sharpness: sharpness,
@@ -981,8 +1008,10 @@ async function processVideo(){
           stableCount++;
         }
         
-        cv.putText(display, `Quality: ${qualityScore.toFixed(2)}`, new cv.Point(10,150), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(255,255,0,255),2);
-        cv.putText(display, `Stable: ${stableCount}/${requiredStableFrames}`, new cv.Point(10,180), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,255,255),2);
+  outCtx.fillStyle = 'rgb(255,255,0)';
+  outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 150);
+  outCtx.fillStyle = 'rgb(0,255,255)';
+  outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 180);
 
         if (stableCount >= requiredStableFrames) {
           // Find best frame based on quality score (not just sharpness)
@@ -1019,8 +1048,7 @@ async function processVideo(){
           stopCamera();
           
           const displayFrame = capturedFrame.clone();
-          // Draw nothing on final capture; keep clean
-          
+          // Draw notice on final capture and show once via OpenCV (OK to use cv here)
           cv.putText(displayFrame, "Card Detected! Click 'Crop Card' to extract", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,255,0,255),2);
           cv.imshow(canvasOutput, displayFrame);
           displayFrame.delete();
@@ -1036,17 +1064,20 @@ async function processVideo(){
         frameHistory = [];
         
         if (toggleBlurWarn.checked) {
-          if (!inFrame) cv.putText(display, "Move card INTO the frame", new cv.Point(10,180), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(255,0,0,255),2);
-          if (!isSharp) cv.putText(display, "Image too blurry - hold steady", new cv.Point(10,210), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,0,255,255),2);
-          if (hasReflection) cv.putText(display, "Light reflection detected - adjust angle", new cv.Point(10,240), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(255,165,0,255),2);
-          if (score <= scoreThreshold) cv.putText(display, "Position card better in frame", new cv.Point(10,270), cv.FONT_HERSHEY_SIMPLEX, 0.7, new cv.Scalar(0,0,255,255),2);
+          outCtx.fillStyle = 'rgb(255,0,0)';
+          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 180);
+          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 210);
+          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 240); }
+          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 270); }
         }
       }
 
-      // Draw detection rectangle
-      const rectColor = new cv.Scalar(0, 255, 0, 255);
-      cv.rectangle(display, new cv.Point(Math.round(x1), Math.round(y1)), new cv.Point(Math.round(x2), Math.round(y2)), rectColor, 2);
+      // Draw detection rectangle (Canvas 2D)
+      outCtx.strokeStyle = 'rgb(0,255,0)';
+      outCtx.lineWidth = 2;
+      outCtx.strokeRect(Math.round(x1), Math.round(y1), Math.round(x2-x1), Math.round(y2-y1));
       bestLocalContour.delete();
+      if (srcMatForThisFrame) { srcMatForThisFrame.delete(); srcMatForThisFrame = null; }
     } else {
       stableCount = 0;
       frameHistory.forEach(f => {
@@ -1055,12 +1086,25 @@ async function processVideo(){
       });
       frameHistory = [];
       
-      cv.putText(display, "No card detected", new cv.Point(10,30), cv.FONT_HERSHEY_SIMPLEX, 0.9, new cv.Scalar(0,0,255,255),2);
-      cv.putText(display, "Place card in the frame", new cv.Point(10,60), cv.FONT_HERSHEY_SIMPLEX, 0.6, new cv.Scalar(0,0,255,255),2);
+      outCtx.fillStyle = 'rgb(0,0,255)';
+      outCtx.font = '18px sans-serif';
+      outCtx.fillText('No card detected', 10, 30);
+      outCtx.font = '16px sans-serif';
+      outCtx.fillText('Place card in the frame', 10, 60);
     }
-
-    cv.imshow(canvasOutput, display);
-    display.delete();
+    const tD0 = performance.now();
+    // We already drew to outCtx; treat the overlay duration as draw time
+    const tD1 = performance.now();
+    if (PROFILE) lastProfile.drawMs = tD1 - tD0;
+    if (PROFILE) {
+      lastProfile.grabMs = tAfterGrab - tFrame0;
+      lastProfile.yoloMs = lastYoloMs || (tAfterYolo - tAfterGrab);
+      lastProfile.totalMs = (performance.now() - tFrame0);
+      // Log occasionally to avoid spamming
+      if ((window.__profTick = (window.__profTick||0)+1) % 30 === 0) {
+        console.log(`Perf: total=${lastProfile.totalMs.toFixed(1)}ms, grab=${lastProfile.grabMs.toFixed(1)}ms, yolo=${lastProfile.yoloMs.toFixed(1)}ms, sharp=${lastProfile.sharpMs.toFixed(1)}ms, refl=${lastProfile.reflMs.toFixed(1)}ms, draw=${lastProfile.drawMs.toFixed(1)}ms`);
+      }
+    }
 
   } catch (err){
     console.error(err);
@@ -1081,7 +1125,13 @@ async function processVideo(){
     const fps = (1000 / (dt || 16.7)).toFixed(1);
     if (statusEl) {
       const base = streaming ? 'Camera started' : statusEl.innerText.split(' | ')[0];
-      statusEl.innerText = `${base} | FPS ~ ${fps}${lastYoloMs?` | YOLO ${lastYoloMs.toFixed(0)}ms`:''}`;
+      let perfStr = '';
+      if (PROFILE) {
+        perfStr = ` | Proc ${lastProfile.totalMs.toFixed(0)}ms (grab ${lastProfile.grabMs.toFixed(0)}, yolo ${lastProfile.yoloMs.toFixed(0)}, sharp ${lastProfile.sharpMs.toFixed(0)}, refl ${lastProfile.reflMs.toFixed(0)}, draw ${lastProfile.drawMs.toFixed(0)})`;
+      } else if (lastYoloMs) {
+        perfStr = ` | YOLO ${lastYoloMs.toFixed(0)}ms`;
+      }
+      statusEl.innerText = `${base} | FPS ~ ${fps}${perfStr}`;
     }
     scheduleNextFrame(processVideo);
   }

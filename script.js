@@ -35,6 +35,7 @@ const historySize = 10; // Increase history size to capture more frames
 // Add at top with other variables
 let frameSkipCounter = 0;
 let PROCESS_EVERY_N_FRAMES = 2; // adaptive; will tune for mobile
+let EXPENSIVE_CHECK_EVERY_N = 2; // run sharp/reflection every N good frames on mobile
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
 
@@ -113,8 +114,9 @@ async function startCamera() {
       ? {
           video: {
             facingMode: { ideal: "environment" },
-            width: { ideal: 1280, max: 1280 },
-            height: { ideal: 720, max: 720 },
+            // Lower resolution on mobile for faster CPU-side processing
+            width: { ideal: 960, max: 960 },
+            height: { ideal: 540, max: 540 },
             frameRate: { ideal: 30, max: 30 }
           },
           audio: false
@@ -148,6 +150,7 @@ async function startCamera() {
             // Slightly higher skip on mobile to save CPU/GPU
             if (isMobile()) {
               PROCESS_EVERY_N_FRAMES = 3;
+              EXPENSIVE_CHECK_EVERY_N = 2;
             }
             // Give one more frame delay before processing
             setTimeout(() => scheduleNextFrame(processVideo), 100);
@@ -203,143 +206,80 @@ function toDegree(rad){ return Math.abs(rad * 180.0 / Math.PI); }
 // --- helper conversions of your Python functions ---
 
 function calculateSharpness(frameMatColor, contour){
-  // create mask
-  const mask = cv.Mat.zeros(frameMatColor.rows, frameMatColor.cols, cv.CV_8UC1);
-  const contourVec = new cv.MatVector();
-  contourVec.push_back(contour);
-  cv.drawContours(mask, contourVec, 0, new cv.Scalar(255), -1);
-  // gray
-  const grayLocal = new cv.Mat();
-  cv.cvtColor(frameMatColor, grayLocal, cv.COLOR_RGBA2GRAY);
-  const cardRegion = new cv.Mat();
-  cv.bitwise_and(grayLocal, grayLocal, cardRegion, mask);
-
-  // Laplacian variance
+  // Fast path: compute Laplacian variance on bbox ROI instead of masked full frame
+  // Convert contour (4-point rect) to bounding rect
+  const rect = cv.boundingRect(contour);
+  const x = Math.max(0, rect.x), y = Math.max(0, rect.y);
+  const w = Math.max(1, Math.min(frameMatColor.cols - x, rect.width));
+  const h = Math.max(1, Math.min(frameMatColor.rows - y, rect.height));
+  const roi = frameMatColor.roi(new cv.Rect(x, y, w, h));
+  const gray = new cv.Mat();
+  cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
   const lap = new cv.Mat();
-  cv.Laplacian(cardRegion, lap, cv.CV_64F);
-  // compute variance manually
+  cv.Laplacian(gray, lap, cv.CV_64F);
   const mean = new cv.Mat();
   const stddev = new cv.Mat();
-  cv.meanStdDev(lap, mean, stddev, mask);
+  // No mask needed when using ROI
+  cv.meanStdDev(lap, mean, stddev);
   const variance = Math.pow(stddev.doubleAt(0,0), 2);
-
   // cleanup
-  mask.delete(); contourVec.delete(); grayLocal.delete(); cardRegion.delete(); lap.delete(); mean.delete(); stddev.delete();
-
+  roi.delete(); gray.delete(); lap.delete(); mean.delete(); stddev.delete();
   // scale to 0-100 similarly
   return Math.min(variance / 5.0, 100.0);
 }
 
 function detectReflection(frameMatColor, contour) {
-  // ตรวจจับแสงสะท้อนบนการ์ด (รวมทั้ง spike reflections)
-  const mask = cv.Mat.zeros(frameMatColor.rows, frameMatColor.cols, cv.CV_8UC1);
-  const contourVec = new cv.MatVector();
-  contourVec.push_back(contour);
-  cv.drawContours(mask, contourVec, 0, new cv.Scalar(255), -1);
-  
-  // แปลงเป็น grayscale
-  const grayLocal = new cv.Mat();
-  cv.cvtColor(frameMatColor, grayLocal, cv.COLOR_RGBA2GRAY);
-  
-  // หาค่าเฉลี่ยความสว่างของการ์ดทั้งหมด
-  const cardRegionGray = new cv.Mat();
-  cv.bitwise_and(grayLocal, grayLocal, cardRegionGray, mask);
+  // Fast reflection check on bbox ROI; skip connected components on mobile
+  const rect = cv.boundingRect(contour);
+  const rx = Math.max(0, rect.x), ry = Math.max(0, rect.y);
+  const rw = Math.max(1, Math.min(frameMatColor.cols - rx, rect.width));
+  const rh = Math.max(1, Math.min(frameMatColor.rows - ry, rect.height));
+  const roi = frameMatColor.roi(new cv.Rect(rx, ry, rw, rh));
+  const gray = new cv.Mat();
+  cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
+
   const meanMat = new cv.Mat();
   const stddevMat = new cv.Mat();
-  cv.meanStdDev(cardRegionGray, meanMat, stddevMat, mask);
+  cv.meanStdDev(gray, meanMat, stddevMat);
   const meanBrightness = meanMat.doubleAt(0, 0);
   const stddevBrightness = stddevMat.doubleAt(0, 0);
-  
-  // หาพื้นที่ที่สว่างมากกว่าค่าเฉลี่ย + 2*std (outliers)
+
   const spikeThreshold = Math.min(meanBrightness + 2 * stddevBrightness, 245);
-  const brightThreshold = new cv.Mat();
-  cv.threshold(grayLocal, brightThreshold, spikeThreshold, 255, cv.THRESH_BINARY);
-  
-  // นับจำนวนพิกเซลที่สว่างเกินไปในพื้นที่การ์ด
-  const cardRegion = new cv.Mat();
-  cv.bitwise_and(brightThreshold, brightThreshold, cardRegion, mask);
-  
-  const brightPixels = cv.countNonZero(cardRegion);
-  const totalPixels = cv.countNonZero(mask);
+  const bright = new cv.Mat();
+  cv.threshold(gray, bright, spikeThreshold, 255, cv.THRESH_BINARY);
+  const brightPixels = cv.countNonZero(bright);
+  const totalPixels = rw * rh;
   const reflectionRatio = brightPixels / totalPixels;
-  
-  // ตรวจจับ spike reflections โดยหา connected components (ทำเมื่อมีแสงจ้าในระดับหนึ่งเพื่อลดภาระ)
+
+  // Optionally run expensive spike analysis only on desktop
+  const doSpike = !isMobile() && reflectionRatio > 0.05;
   let hasSpikeReflection = false;
-  let maxSpikeIntensity = 0;
-  if (reflectionRatio > 0.05) {
+  if (doSpike) {
     const labels = new cv.Mat();
     const stats = new cv.Mat();
-    const centroids = new cv.Mat();
-    const numLabels = cv.connectedComponentsWithStats(cardRegion, labels, stats, centroids);
-
-    // ตรวจสอบแต่ละ component (ข้าม label 0 ซึ่งเป็น background)
-    for (let i = 1; i < numLabels; i++) {
+    const cents = new cv.Mat();
+    cv.connectedComponentsWithStats(bright, labels, stats, cents);
+    // Heuristic: any compact component within 0.1% - 5% area
+    const minSpike = totalPixels * 0.001;
+    const maxSpike = totalPixels * 0.05;
+    const rows = stats.rows;
+    for (let i = 1; i < rows; i++) {
       const area = stats.intAt(i, cv.CC_STAT_AREA);
-      const x = stats.intAt(i, cv.CC_STAT_LEFT);
-      const y = stats.intAt(i, cv.CC_STAT_TOP);
-      const width = stats.intAt(i, cv.CC_STAT_WIDTH);
-      const height = stats.intAt(i, cv.CC_STAT_HEIGHT);
-      
-      // คำนวณความเข้มข้นของ spike (area / bounding box)
-      const boundingBoxArea = width * height;
-      const density = area / boundingBoxArea;
-      
-      // Spike reflection = พื้นที่เล็ก (0.1% - 5% ของการ์ด) แต่เข้มข้นสูง (density > 0.3)
-      const minSpikeArea = totalPixels * 0.001;  // 0.1%
-      const maxSpikeArea = totalPixels * 0.05;   // 5%
-      
-      if (area > minSpikeArea && area < maxSpikeArea && density > 0.3) {
-        // ตรวจสอบว่า spike นี้สว่างกว่าค่าเฉลี่ยมากพอหรือไม่
-        const spikeROI = grayLocal.roi(new cv.Rect(x, y, width, height));
-        const spikeMask = labels.roi(new cv.Rect(x, y, width, height));
-        const spikeMaskBinary = new cv.Mat();
-        const labelVal = new cv.Mat(height, width, spikeMask.type(), new cv.Scalar(i));
-        cv.compare(spikeMask, labelVal, spikeMaskBinary, cv.CMP_EQ);
-        
-  const spikeMean = new cv.Mat();
-  const spikeStd = new cv.Mat();
-  cv.meanStdDev(spikeROI, spikeMean, spikeStd, spikeMaskBinary);
-        const spikeIntensity = spikeMean.doubleAt(0, 0);
-        
-        // Spike ต้องสว่างกว่าค่าเฉลี่ยอย่างน้อย 40 units
-        if (spikeIntensity - meanBrightness > 40) {
-          hasSpikeReflection = true;
-          maxSpikeIntensity = Math.max(maxSpikeIntensity, spikeIntensity - meanBrightness);
-        }
-        
-        // Cleanup ROI temporaries
-        spikeMaskBinary.delete();
-  spikeMean.delete();
-  spikeStd.delete();
-        spikeROI.delete();
-        spikeMask.delete();
-        labelVal.delete();
-      }
+      const bw = stats.intAt(i, cv.CC_STAT_WIDTH);
+      const bh = stats.intAt(i, cv.CC_STAT_HEIGHT);
+      const density = area / (bw * bh);
+      if (area > minSpike && area < maxSpike && density > 0.3) { hasSpikeReflection = true; break; }
     }
-
-    // cleanup CC mats
-    labels.delete();
-    stats.delete();
-    centroids.delete();
+    labels.delete(); stats.delete(); cents.delete();
   }
 
-  // cleanup commons
-  mask.delete();
-  contourVec.delete();
-  grayLocal.delete();
-  cardRegionGray.delete();
-  meanMat.delete();
-  stddevMat.delete();
-  brightThreshold.delete();
-  cardRegion.delete();
-  
-  // ตรวจพบแสงสะท้อนถ้า:
-  // 1. มีพื้นที่สว่างเกินไปมากกว่า 15%
-  // 2. หรือมี spike reflection ที่สว่างกว่าค่าเฉลี่ยมาก
+  // cleanup
+  roi.delete(); gray.delete(); meanMat.delete(); stddevMat.delete(); bright.delete();
+
   return {
     hasReflection: reflectionRatio > 0.15 || hasSpikeReflection,
-    reflectionRatio: reflectionRatio,
-    hasSpikeReflection: hasSpikeReflection
+    reflectionRatio,
+    hasSpikeReflection
   };
 }
 
@@ -554,7 +494,7 @@ async function initYolo() {
   // Try to init Web Worker first for multi-thread speedup
   try {
     yoloWorker = new Worker('yoloWorker.js');
-  const allowWebGPU = !isMobile() && !!navigator.gpu;
+  const allowWebGPU = !!navigator.gpu; // allow WebGPU on mobile if available
   // Use a single WASM thread unless COOP/COEP enabled (crossOriginIsolated)
   const coi = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated);
   const numThreads = coi ? Math.min(4, (navigator.hardwareConcurrency || 4)) : 1;
@@ -615,7 +555,7 @@ async function initYolo() {
   const ep = [];
   const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
   const mobile = isMobile();
-  if (!mobile && navigator.gpu) ep.push('webgpu');
+  if (navigator.gpu) ep.push('webgpu');
   if (gl) ep.push('webgl');
   ep.push('wasm');
   yoloProviders = ep;
@@ -650,7 +590,7 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
   // Favor speed on mobile
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = isMobile() ? 'low' : 'high';
-  // ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
+  ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
   return { scale: r, padX: dw, padY: dh, newW, newH };
 }
 
@@ -929,21 +869,27 @@ async function processVideo(){
 
   const score = calculateCardScore(bestLocalContour, {width: frameW, height: frameH});
       
-      // Only calculate sharpness if score is good enough
+      // Only calculate sharpness/reflection if score is good enough
       let sharpness = 0;
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
-      
       let srcMatForThisFrame = null;
-      if (score > scoreThreshold - 0.1) { // Pre-filter by score
+      let doExpensive = true;
+      if (isMobile()) {
+        // Rate-limit expensive checks on mobile
+        if (!window.__expensiveTick) window.__expensiveTick = 0;
+        window.__expensiveTick = (window.__expensiveTick + 1) % EXPENSIVE_CHECK_EVERY_N;
+        doExpensive = window.__expensiveTick === 0;
+      }
+      if (score > scoreThreshold - 0.1 && doExpensive) { // Pre-filter by score
         // Only create OpenCV Mat when needed (lazy)
         srcMatForThisFrame = cv.imread(reusableTempCanvas);
         const tS0 = performance.now();
         sharpness = calculateSharpness(srcMatForThisFrame, bestLocalContour);
         const tS1 = performance.now();
         if (PROFILE) lastProfile.sharpMs = tS1 - tS0;
-        const isSharp = sharpness >= sharpnessThreshold;
+        const isSharpNow = sharpness >= sharpnessThreshold;
         // Only check reflection if sharp enough
-        if (isSharp) {
+        if (isSharpNow) {
           const tR0 = performance.now();
           reflectionData = detectReflection(srcMatForThisFrame, bestLocalContour);
           const tR1 = performance.now();
@@ -951,7 +897,7 @@ async function processVideo(){
         }
       }
       
-      const isSharp = sharpness >= sharpnessThreshold;
+  const isSharp = sharpness >= sharpnessThreshold; // only count when computed
       const inFrame = isCardInFrame(bestLocalContour, guideBox);
       const hasReflection = reflectionData.hasReflection;
       const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection;

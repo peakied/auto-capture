@@ -7,7 +7,7 @@
 
 let ortLoaded = false;
 let ortSession = null;
-let yoloInputShape = [1, 3, 640, 640]; // NCHW
+let yoloInputShape = [1, 3, 160, 160]; // NCHW (fixed for 160x160)
 let yoloInputName = null;
 let providers = [];
 let yoloScoreThresh = 0.4;
@@ -91,52 +91,54 @@ function postprocessYolo(outTensor, info, origW, origH) {
   const dims = outTensor.dims;
   const boxes = [], scores = [], classes = [];
   const gain = info.scale, padX = info.padX, padY = info.padY;
-  const inW = yoloInputShape[2], inH = yoloInputShape[3];
+  // yoloInputShape is [N,C,H,W]
+  const inH = yoloInputShape[2], inW = yoloInputShape[3];
 
-  if (dims.length === 3 && dims[2] >= 6 && dims[1] > 1000) {
-    const N = dims[1]; const no = dims[2]; const numClasses = no - 5;
-    let needSig = false;
-    for (let k = 0; k < Math.min(10, N); k++) { if (data[k*no+4] > 1) { needSig = true; break; } }
-    for (let i = 0; i < N; i++) {
-      const off = i * no;
-      let cx = data[off+0], cy = data[off+1], w = data[off+2], h = data[off+3];
-      let obj = data[off+4]; if (needSig) obj = sigmoid(obj);
-      let best = 0, bestIdx = 0;
-      for (let c = 0; c < numClasses; c++) {
-        let v = data[off+5+c]; if (needSig) v = sigmoid(v);
-        if (v > best) { best = v; bestIdx = c; }
+  if (dims.length === 3) {
+    const a = dims[1], b = dims[2];
+    if (b >= 6 && b <= 256) {
+      // [1, N=a, no=b]
+      const N = a; const no = b; const numClasses = no - 5;
+      let needSig = false;
+      for (let k = 0; k < Math.min(10, N); k++) { if (data[k*no+4] > 1) { needSig = true; break; } }
+      for (let i = 0; i < N; i++) {
+        const off = i * no;
+        let cx = data[off+0], cy = data[off+1], w = data[off+2], h = data[off+3];
+        let obj = data[off+4]; if (needSig) obj = sigmoid(obj);
+        let best = 0, bestIdx = 0;
+        for (let c = 0; c < numClasses; c++) {
+          let v = data[off+5+c]; if (needSig) v = sigmoid(v);
+          if (v > best) { best = v; bestIdx = c; }
+        }
+        const conf = obj * (numClasses > 0 ? best : 1);
+        if (conf < yoloScoreThresh) continue;
+        let [x1,y1,x2,y2] = xywh2xyxy(cx,cy,w,h);
+        x1 = (x1 - padX) / gain; y1 = (y1 - padY) / gain; x2 = (x2 - padX) / gain; y2 = (y2 - padY) / gain;
+        x1 = Math.max(0, Math.min(origW-1, x1)); y1 = Math.max(0, Math.min(origH-1, y1));
+        x2 = Math.max(0, Math.min(origW-1, x2)); y2 = Math.max(0, Math.min(origH-1, y2));
+        boxes.push([x1,y1,x2,y2]); scores.push(conf); classes.push(bestIdx);
       }
-      const conf = obj * (numClasses > 0 ? best : 1);
-      if (conf < yoloScoreThresh) continue;
-      let [x1,y1,x2,y2] = xywh2xyxy(cx,cy,w,h);
-      x1 = (x1 - padX) / gain; y1 = (y1 - padY) / gain;
-      x2 = (x2 - padX) / gain; y2 = (y2 - padY) / gain;
-      x1 = Math.max(0, Math.min(origW-1, x1));
-      y1 = Math.max(0, Math.min(origH-1, y1));
-      x2 = Math.max(0, Math.min(origW-1, x2));
-      y2 = Math.max(0, Math.min(origH-1, y2));
-      boxes.push([x1,y1,x2,y2]); scores.push(conf); classes.push(bestIdx);
-    }
-  } else if (dims.length === 3 && dims[1] >= 6 && dims[2] > 1000) {
-    const no = dims[1]; const N = dims[2]; const numClasses = no - 4;
-    let needSig = false;
-    for (let k = 0; k < Math.min(10, N); k++) { if (data[4*N + k] > 1) { needSig = true; break; } }
-    for (let i = 0; i < N; i++) {
-      const cx = data[0*N + i], cy = data[1*N + i], w = data[2*N + i], h = data[3*N + i];
-      let best = 0, bestIdx = 0;
-      for (let c = 0; c < numClasses; c++) {
-        let v = data[(4+c)*N + i]; if (needSig) v = sigmoid(v);
-        if (v > best) { best = v; bestIdx = c; }
+    } else if (a >= 6 && a <= 256) {
+      // [1, no=a, N=b]
+      const no = a; const N = b; const numClasses = no - 4;
+      let needSig = false;
+      for (let k = 0; k < Math.min(10, N); k++) { if (data[4*N + k] > 1) { needSig = true; break; } }
+      for (let i = 0; i < N; i++) {
+        const cx = data[0*N + i], cy = data[1*N + i], w = data[2*N + i], h = data[3*N + i];
+        let best = 0, bestIdx = 0;
+        for (let c = 0; c < numClasses; c++) {
+          let v = data[(4+c)*N + i]; if (needSig) v = sigmoid(v);
+          if (v > best) { best = v; bestIdx = c; }
+        }
+        const conf = best; if (conf < yoloScoreThresh) continue;
+        let [x1,y1,x2,y2] = xywh2xyxy(cx,cy,w,h);
+        x1 = (x1 - padX) / gain; y1 = (y1 - padY) / gain; x2 = (x2 - padX) / gain; y2 = (y2 - padY) / gain;
+        x1 = Math.max(0, Math.min(origW-1, x1)); y1 = Math.max(0, Math.min(origH-1, y1));
+        x2 = Math.max(0, Math.min(origW-1, x2)); y2 = Math.max(0, Math.min(origH-1, y2));
+        boxes.push([x1,y1,x2,y2]); scores.push(conf); classes.push(bestIdx);
       }
-      const conf = best; if (conf < yoloScoreThresh) continue;
-      let [x1,y1,x2,y2] = xywh2xyxy(cx,cy,w,h);
-      x1 = (x1 - padX) / gain; y1 = (y1 - padY) / gain;
-      x2 = (x2 - padX) / gain; y2 = (y2 - padY) / gain;
-      x1 = Math.max(0, Math.min(origW-1, x1));
-      y1 = Math.max(0, Math.min(origH-1, y1));
-      x2 = Math.max(0, Math.min(origW-1, x2));
-      y2 = Math.max(0, Math.min(origH-1, y2));
-      boxes.push([x1,y1,x2,y2]); scores.push(conf); classes.push(bestIdx);
+    } else {
+      console.warn('Unexpected YOLO output dims (worker):', dims);
     }
   }
   const keep = nms(boxes, scores, yoloNmsIouThresh, 20);
@@ -188,11 +190,6 @@ self.onmessage = async (ev) => {
       ortSession = await self.ort.InferenceSession.create(modelPath, so);
       const firstInput = ortSession.inputNames[0];
       yoloInputName = firstInput;
-      const meta = ortSession.inputMetadata[firstInput];
-      if (meta && Array.isArray(meta.dimensions)) {
-        const dims = meta.dimensions.map(d => (typeof d === 'number' && d > 0 ? d : null));
-        if (dims[2] && dims[3]) yoloInputShape = [1, 3, dims[2], dims[3]];
-      }
 
       self.postMessage({ type: 'ready', providers, inputShape: yoloInputShape });
       return;
@@ -200,11 +197,12 @@ self.onmessage = async (ev) => {
 
     if (msg.type === 'detect') {
       if (!ortSession) { self.postMessage({ type: 'error', error: 'Session not ready' }); return; }
-      const bitmap = msg.bitmap; // ImageBitmap
-      const origW = msg.origW, origH = msg.origH;
-      const inW = yoloInputShape[2], inH = yoloInputShape[3];
+    const bitmap = msg.bitmap; // ImageBitmap
+    const origW = msg.origW, origH = msg.origH;
+    // Use [N,C,H,W] to derive canvas width/height
+  const inH = yoloInputShape[2], inW = yoloInputShape[3];
   const canvas = new OffscreenCanvas(inW, inH);
-      const info = letterboxToCanvas(bitmap, canvas, inW, inH);
+  const info = letterboxToCanvas(bitmap, canvas, inW, inH);
       const chw = preprocessToCHW(canvas);
       const input = new self.ort.Tensor('float32', chw, [1, 3, inH, inW]);
       const feeds = {}; feeds[yoloInputName] = input;

@@ -45,7 +45,7 @@ let yoloWorkerReady = false;
 let yoloRequestInFlight = false;
 let lastDetections = [];
 let lastYoloMs = 0;
-let modelPath = null; // auto-chosen model
+let modelPath = 'best160.onnx'; // auto-chosen model
 
 // Lightweight profiling toggles/holders
 let PROFILE = true; // set false to disable timing updates
@@ -109,19 +109,8 @@ if (document.readyState === 'loading') {
 async function startCamera() {
   try {
     // Pick constraints suited for device
-    const mobile = isMobile();
-    const constraints = mobile
-      ? {
-          video: {
-            facingMode: { ideal: "environment" },
-            // Lower resolution on mobile for faster CPU-side processing
-            width: { ideal: 960, max: 960 },
-            height: { ideal: 540, max: 540 },
-            frameRate: { ideal: 30, max: 30 }
-          },
-          audio: false
-        }
-      : {
+    const constraints = 
+        {
           video: {
             width: { ideal: 1280 },
             height: { ideal: 720 },
@@ -185,6 +174,7 @@ function initializeMats(){
   const h = video.videoHeight;
   const w = video.videoWidth;
   console.log('Video dimensions:', w, 'x', h);
+  console.log('isMobile:', isMobile());
   
   canvasOutput.width = w;
   canvasOutput.height = h;
@@ -252,26 +242,23 @@ function detectReflection(frameMatColor, contour) {
   const reflectionRatio = brightPixels / totalPixels;
 
   // Optionally run expensive spike analysis only on desktop
-  const doSpike = !isMobile() && reflectionRatio > 0.05;
   let hasSpikeReflection = false;
-  if (doSpike) {
-    const labels = new cv.Mat();
-    const stats = new cv.Mat();
-    const cents = new cv.Mat();
-    cv.connectedComponentsWithStats(bright, labels, stats, cents);
-    // Heuristic: any compact component within 0.1% - 5% area
-    const minSpike = totalPixels * 0.001;
-    const maxSpike = totalPixels * 0.05;
-    const rows = stats.rows;
-    for (let i = 1; i < rows; i++) {
-      const area = stats.intAt(i, cv.CC_STAT_AREA);
-      const bw = stats.intAt(i, cv.CC_STAT_WIDTH);
-      const bh = stats.intAt(i, cv.CC_STAT_HEIGHT);
-      const density = area / (bw * bh);
-      if (area > minSpike && area < maxSpike && density > 0.3) { hasSpikeReflection = true; break; }
-    }
-    labels.delete(); stats.delete(); cents.delete();
+  const labels = new cv.Mat();
+  const stats = new cv.Mat();
+  const cents = new cv.Mat();
+  cv.connectedComponentsWithStats(bright, labels, stats, cents);
+  // Heuristic: any compact component within 0.1% - 5% area
+  const minSpike = totalPixels * 0.001;
+  const maxSpike = totalPixels * 0.05;
+  const rows = stats.rows;
+  for (let i = 1; i < rows; i++) {
+    const area = stats.intAt(i, cv.CC_STAT_AREA);
+    const bw = stats.intAt(i, cv.CC_STAT_WIDTH);
+    const bh = stats.intAt(i, cv.CC_STAT_HEIGHT);
+    const density = area / (bw * bh);
+    if (area > minSpike && area < maxSpike && density > 0.3) { hasSpikeReflection = true; break; }
   }
+  labels.delete(); stats.delete(); cents.delete();
 
   // cleanup
   roi.delete(); gray.delete(); meanMat.delete(); stddevMat.delete(); bright.delete();
@@ -488,9 +475,6 @@ function extractCardRegion(frameMat, contour){
 
 // ================== YOLO (ONNX Runtime Web) helpers ==================
 async function initYolo() {
-  // Choose model path (faster on mobile by default)
-  modelPath = 'best160.onnx';
-
   // Try to init Web Worker first for multi-thread speedup
   try {
     yoloWorker = new Worker('yoloWorker.js');
@@ -554,7 +538,6 @@ async function initYolo() {
 
   const ep = [];
   const gl = document.createElement('canvas').getContext('webgl2') || document.createElement('canvas').getContext('webgl');
-  const mobile = isMobile();
   if (navigator.gpu) ep.push('webgpu');
   if (gl) ep.push('webgl');
   ep.push('wasm');
@@ -589,7 +572,7 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
   ctx.fillRect(0, 0, dstW, dstH);
   // Favor speed on mobile
   ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = isMobile() ? 'low' : 'high';
+  ctx.imageSmoothingQuality = 'low';
   ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
   return { scale: r, padX: dw, padY: dh, newW, newH };
 }

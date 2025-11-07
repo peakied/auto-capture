@@ -12,6 +12,7 @@ let yoloInputName = null;
 let providers = [];
 let yoloScoreThresh = 0.4;
 let yoloNmsIouThresh = 0.45;
+const modelPath = 'best160.onnx';
 
 // Utility
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
@@ -91,8 +92,6 @@ function postprocessYolo(outTensor, info, origW, origH) {
   const dims = outTensor.dims;
   const boxes = [], scores = [], classes = [];
   const gain = info.scale, padX = info.padX, padY = info.padY;
-  // yoloInputShape is [N,C,H,W]
-  const inH = yoloInputShape[2], inW = yoloInputShape[3];
 
   if (dims.length === 3) {
     const a = dims[1], b = dims[2];
@@ -185,7 +184,6 @@ self.onmessage = async (ev) => {
       providers.push('wasm');
 
       const so = { executionProviders: providers, graphOptimizationLevel: 'all' };
-      const modelPath = msg.modelPath || 'best640.onnx';
 
       ortSession = await self.ort.InferenceSession.create(modelPath, so);
       const firstInput = ortSession.inputNames[0];

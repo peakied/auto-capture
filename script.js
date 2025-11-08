@@ -34,8 +34,8 @@ const historySize = 10; // Increase history size to capture more frames
 
 // Add at top with other variables
 let frameSkipCounter = 0;
-let PROCESS_EVERY_N_FRAMES = 2; // adaptive; will tune for mobile
-let EXPENSIVE_CHECK_EVERY_N = 2; // run sharp/reflection every N good frames on mobile
+let PROCESS_EVERY_N_FRAMES = 2;
+let EXPENSIVE_CHECK_EVERY_N = 2;
 let reusableTempCanvas = null; // Reuse canvas
 let yoloCanvas = null; // For letterbox preprocessing
 
@@ -57,12 +57,6 @@ let lastProfile = {
   drawMs: 0,
   totalMs: 0
 };
-
-// Simple mobile detection + capabilities
-function isMobile() {
-  const ua = navigator.userAgent || navigator.vendor || window.opera;
-  return /android|iphone|ipad|ipod|iemobile|mobile/i.test(ua);
-}
 
 // Frame scheduler using requestVideoFrameCallback when available
 function scheduleNextFrame(cb) {
@@ -136,11 +130,6 @@ async function startCamera() {
             }
             initializeMats();
             isProcessing = true;
-            // Slightly higher skip on mobile to save CPU/GPU
-            if (isMobile()) {
-              PROCESS_EVERY_N_FRAMES = 3;
-              EXPENSIVE_CHECK_EVERY_N = 2;
-            }
             // Give one more frame delay before processing
             setTimeout(() => scheduleNextFrame(processVideo), 100);
         }, 200);
@@ -174,7 +163,6 @@ function initializeMats(){
   const h = video.videoHeight;
   const w = video.videoWidth;
   console.log('Video dimensions:', w, 'x', h);
-  console.log('isMobile:', isMobile());
   
   canvasOutput.width = w;
   canvasOutput.height = h;
@@ -219,7 +207,7 @@ function calculateSharpness(frameMatColor, contour){
 }
 
 function detectReflection(frameMatColor, contour) {
-  // Fast reflection check on bbox ROI; skip connected components on mobile
+  // Fast reflection check on bbox ROI
   const rect = cv.boundingRect(contour);
   const rx = Math.max(0, rect.x), ry = Math.max(0, rect.y);
   const rw = Math.max(1, Math.min(frameMatColor.cols - rx, rect.width));
@@ -478,7 +466,7 @@ async function initYolo() {
   // Try to init Web Worker first for multi-thread speedup
   try {
     yoloWorker = new Worker('yoloWorker.js');
-  const allowWebGPU = !!navigator.gpu; // allow WebGPU on mobile if available
+  const allowWebGPU = !!navigator.gpu; // allow WebGPU
   // Use a single WASM thread unless COOP/COEP enabled (crossOriginIsolated)
   const coi = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated);
   const numThreads = coi ? Math.min(4, (navigator.hardwareConcurrency || 4)) : 1;
@@ -570,7 +558,6 @@ function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114
   // Fill with gray
   ctx.fillStyle = `rgba(${fill[0]},${fill[1]},${fill[2]},${fill[3]/255})`;
   ctx.fillRect(0, 0, dstW, dstH);
-  // Favor speed on mobile
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'low';
   ctx.drawImage(srcCanvas, 0, 0, srcW, srcH, dw, dh, newW, newH);
@@ -857,12 +844,6 @@ async function processVideo(){
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
       let srcMatForThisFrame = null;
       let doExpensive = true;
-      if (isMobile()) {
-        // Rate-limit expensive checks on mobile
-        if (!window.__expensiveTick) window.__expensiveTick = 0;
-        window.__expensiveTick = (window.__expensiveTick + 1) % EXPENSIVE_CHECK_EVERY_N;
-        doExpensive = window.__expensiveTick === 0;
-      }
       if (score > scoreThreshold - 0.1 && doExpensive) { // Pre-filter by score
         // Only create OpenCV Mat when needed (lazy)
         srcMatForThisFrame = cv.imread(reusableTempCanvas);

@@ -25,7 +25,6 @@ const yoloScoreThresh = 0.25;   // fixed threshold
 const yoloNmsIouThresh = 0.45; // NMS IoU threshold
 
 const scoreThreshold = 0.60; // card positioning threshold (our combined score)
-const sharpnessThreshold = 35; // Slightly lower for more flexibility
 const requiredStableFrames = 15; // Increase to get more samples
 const inFrameThreshold = 0.7;
 // Add aspect ratio constants
@@ -55,7 +54,6 @@ let PROFILE = true; // set false to disable timing updates
 let lastProfile = {
   grabMs: 0,
   yoloMs: 0,
-  sharpMs: 0,
   reflMs: 0,
   drawMs: 0,
   totalMs: 0
@@ -211,29 +209,6 @@ function toDegree(rad){ return Math.abs(rad * 180.0 / Math.PI); }
 
 // --- helper conversions of your Python functions ---
 
-function calculateSharpness(frameMatColor, contour){
-  // Fast path: compute Laplacian variance on bbox ROI instead of masked full frame
-  // Convert contour (4-point rect) to bounding rect
-  const rect = cv.boundingRect(contour);
-  const x = Math.max(0, rect.x), y = Math.max(0, rect.y);
-  const w = Math.max(1, Math.min(frameMatColor.cols - x, rect.width));
-  const h = Math.max(1, Math.min(frameMatColor.rows - y, rect.height));
-  const roi = frameMatColor.roi(new cv.Rect(x, y, w, h));
-  const gray = new cv.Mat();
-  cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
-  const lap = new cv.Mat();
-  cv.Laplacian(gray, lap, cv.CV_64F);
-  const mean = new cv.Mat();
-  const stddev = new cv.Mat();
-  // No mask needed when using ROI
-  cv.meanStdDev(lap, mean, stddev);
-  const variance = Math.pow(stddev.doubleAt(0,0), 2);
-  // cleanup
-  roi.delete(); gray.delete(); lap.delete(); mean.delete(); stddev.delete();
-  // scale to 0-100 similarly
-  return Math.min(variance / 5.0, 100.0);
-}
-
 function detectReflection(frameMatColor, contour) {
   // Fast reflection check on bbox ROI
   const rect = cv.boundingRect(contour);
@@ -352,13 +327,12 @@ function calculateCardScore(contour, frameShape){
   return (areaScore * 0.25 + centerScore * 0.35 + straightnessScore * 0.40);
 }
 
-// New function to calculate combined quality score
-function calculateQualityScore(score, sharpness, reflectionRatio) {
-  const normalizedSharpness = Math.min(sharpness / 100.0, 1.0);
+// New function to calculate combined quality score - remove sharpness parameter
+function calculateQualityScore(score, reflectionRatio) {
   const reflectionPenalty = Math.max(0, 1.0 - (reflectionRatio * 2)); // Penalize reflection
   
-  // Combined quality: 40% positioning, 50% sharpness, 10% reflection penalty
-  return (score * 0.40) + (normalizedSharpness * 0.50) + (reflectionPenalty * 0.10);
+  // Combined quality: 70% positioning, 30% reflection penalty
+  return (score * 0.70) + (reflectionPenalty * 0.30);
 }
 
 function sharpenImage(mat) {
@@ -882,32 +856,23 @@ async function processVideo(){
 
       const score = calculateCardScore(bestLocalContour, {width: frameW, height: frameH});
       
-      // Only calculate sharpness/reflection if score AND ratio are good enough
-      let sharpness = 0;
+      // Only calculate reflection if score AND ratio are good enough - remove sharpness check
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
       let srcMatForThisFrame = null;
       let doExpensive = true;
       if (score > scoreThreshold - 0.1 && hasValidRatio && doExpensive) { // Add ratio check
         // Only create OpenCV Mat when needed (lazy)
         srcMatForThisFrame = cv.imread(reusableTempCanvas);
-        const tS0 = performance.now();
-        sharpness = calculateSharpness(srcMatForThisFrame, bestLocalContour);
-        const tS1 = performance.now();
-        if (PROFILE) lastProfile.sharpMs = tS1 - tS0;
-        const isSharpNow = sharpness >= sharpnessThreshold;
-        // Only check reflection if sharp enough
-        if (isSharpNow) {
-          const tR0 = performance.now();
-          reflectionData = detectReflection(srcMatForThisFrame, bestLocalContour);
-          const tR1 = performance.now();
-          if (PROFILE) lastProfile.reflMs = tR1 - tR0;
-        }
+        
+        const tR0 = performance.now();
+        reflectionData = detectReflection(srcMatForThisFrame, bestLocalContour);
+        const tR1 = performance.now();
+        if (PROFILE) lastProfile.reflMs = tR1 - tR0;
       }
       
-      const isSharp = sharpness >= sharpnessThreshold;
       const inFrame = isCardInFrame(bestLocalContour, guideBox);
       const hasReflection = reflectionData.hasReflection;
-      const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection && hasValidRatio; // Add ratio check
+      const isGood = (score > scoreThreshold) && inFrame && !hasReflection && hasValidRatio; // Remove sharpness check
 
       // Colors - show red if ratio is invalid
       const colorStr = isGood ? 'rgb(0,255,0)' : 
@@ -916,23 +881,22 @@ async function processVideo(){
       outCtx.fillStyle = colorStr;
       outCtx.font = '18px sans-serif';
       outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
-      outCtx.fillStyle = (isSharp ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-      outCtx.font = '16px sans-serif';
-      outCtx.fillText(`Sharp: ${sharpness.toFixed(1)}`, 10, 60);
+      // Remove sharpness display
       outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-      outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 90);
+      outCtx.font = '16px sans-serif';
+      outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 60);
       outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
-      outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 120);
+      outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 90);
       
       // Add ratio display
       outCtx.fillStyle = (hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)');
-      outCtx.fillText(`Ratio: ${ratioCheck.ratio.toFixed(2)} (${ratioCheck.orientation})`, 10, 150);
+      outCtx.fillText(`Ratio: ${ratioCheck.ratio.toFixed(2)} (${ratioCheck.orientation})`, 10, 120);
       outCtx.fillStyle = (hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)');
-      outCtx.fillText(`Expected: ${CARD_RATIO.toFixed(2)} ±${RATIO_TOLERANCE.toFixed(2)}`, 10, 180);
+      outCtx.fillText(`Expected: ${CARD_RATIO.toFixed(2)} ±${RATIO_TOLERANCE.toFixed(2)}`, 10, 150);
 
       if (isGood) {
-        // Calculate quality score for comparison
-        const qualityScore = calculateQualityScore(score, sharpness, reflectionData.reflectionRatio);
+        // Calculate quality score for comparison - remove sharpness parameter
+        const qualityScore = calculateQualityScore(score, reflectionData.reflectionRatio);
         
         // Store frame with quality score (ensure we have a Mat)
         if (!srcMatForThisFrame) srcMatForThisFrame = cv.imread(reusableTempCanvas);
@@ -940,7 +904,6 @@ async function processVideo(){
           frame: srcMatForThisFrame.clone(),
           contour: bestLocalContour.clone(),
           score: score,
-          sharpness: sharpness,
           qualityScore: qualityScore
         });
         
@@ -961,12 +924,12 @@ async function processVideo(){
         }
         
         outCtx.fillStyle = 'rgb(255,255,0)';
-        outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 210);
+        outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 180);
         outCtx.fillStyle = 'rgb(0,255,255)';
-        outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 240);
+        outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 210);
 
         if (stableCount >= requiredStableFrames) {
-          // Find best frame based on quality score (not just sharpness)
+          // Find best frame based on quality score
           let bestFrameData = frameHistory[0];
           for (let i = 1; i < frameHistory.length; i++) {
             if (frameHistory[i].qualityScore > bestFrameData.qualityScore) {
@@ -975,7 +938,6 @@ async function processVideo(){
           }
           
           console.log('Selected frame - Quality:', bestFrameData.qualityScore.toFixed(3), 
-                     'Sharpness:', bestFrameData.sharpness.toFixed(1),
                      'Score:', bestFrameData.score.toFixed(3));
           
           if (capturedFrame) capturedFrame.delete();
@@ -1017,11 +979,10 @@ async function processVideo(){
         
         if (toggleBlurWarn.checked) {
           outCtx.fillStyle = 'rgb(255,0,0)';
-          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 270);
-          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 300);
-          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 330); }
-          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 360); }
-          if (!hasValidRatio) { outCtx.fillStyle = 'rgb(255,0,255)'; outCtx.fillText('Card shape not recognized - adjust angle', 10, 390); }
+          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 240);
+          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 270); }
+          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 300); }
+          if (!hasValidRatio) { outCtx.fillStyle = 'rgb(255,0,255)'; outCtx.fillText('Card shape not recognized - adjust angle', 10, 330); }
         }
       }
 
@@ -1045,6 +1006,7 @@ async function processVideo(){
       outCtx.font = '16px sans-serif';
       outCtx.fillText('Place card in the frame', 10, 60);
     }
+    
     const tD0 = performance.now();
     // We already drew to outCtx; treat the overlay duration as draw time
     const tD1 = performance.now();
@@ -1055,7 +1017,7 @@ async function processVideo(){
       lastProfile.totalMs = (performance.now() - tFrame0);
       // Log occasionally to avoid spamming
       if ((window.__profTick = (window.__profTick||0)+1) % 30 === 0) {
-        console.log(`Perf: total=${lastProfile.totalMs.toFixed(1)}ms, grab=${lastProfile.grabMs.toFixed(1)}ms, yolo=${lastProfile.yoloMs.toFixed(1)}ms, sharp=${lastProfile.sharpMs.toFixed(1)}ms, refl=${lastProfile.reflMs.toFixed(1)}ms, draw=${lastProfile.drawMs.toFixed(1)}ms`);
+        console.log(`Perf: total=${lastProfile.totalMs.toFixed(1)}ms, grab=${lastProfile.grabMs.toFixed(1)}ms, yolo=${lastProfile.yoloMs.toFixed(1)}ms, refl=${lastProfile.reflMs.toFixed(1)}ms, draw=${lastProfile.drawMs.toFixed(1)}ms`);
       }
     }
 
@@ -1080,7 +1042,7 @@ async function processVideo(){
       const base = streaming ? 'Camera started' : statusEl.innerText.split(' | ')[0];
       let perfStr = '';
       if (PROFILE) {
-        perfStr = ` | Proc ${lastProfile.totalMs.toFixed(0)}ms (grab ${lastProfile.grabMs.toFixed(0)}, yolo ${lastProfile.yoloMs.toFixed(0)}, sharp ${lastProfile.sharpMs.toFixed(0)}, refl ${lastProfile.reflMs.toFixed(0)}, draw ${lastProfile.drawMs.toFixed(0)})`;
+        perfStr = ` | Proc ${lastProfile.totalMs.toFixed(0)}ms (grab ${lastProfile.grabMs.toFixed(0)}, yolo ${lastProfile.yoloMs.toFixed(0)}, refl ${lastProfile.reflMs.toFixed(0)}, draw ${lastProfile.drawMs.toFixed(0)})`;
       } else if (lastYoloMs) {
         perfStr = ` | YOLO ${lastYoloMs.toFixed(0)}ms`;
       }

@@ -28,6 +28,9 @@ const scoreThreshold = 0.60; // card positioning threshold (our combined score)
 const sharpnessThreshold = 35; // Slightly lower for more flexibility
 const requiredStableFrames = 15; // Increase to get more samples
 const inFrameThreshold = 0.7;
+// Add aspect ratio constants
+const CARD_RATIO = 1.59; // Standard card ratio (86mm / 54mm)
+const RATIO_TOLERANCE = 0.15; // Allow 15% deviation from standard ratio
 let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
 const historySize = 10; // Increase history size to capture more frames
@@ -822,6 +825,10 @@ async function processVideo(){
       const det = detections[0];
       const [x1,y1,x2,y2] = det.box;
 
+      // Check aspect ratio first
+      const ratioCheck = isValidCardRatio(det.box);
+      const hasValidRatio = ratioCheck.isValid;
+
       // Build a 4-point rectangle contour
       const bestLocalContour = new cv.Mat(4,1,cv.CV_32SC2);
       // top-left
@@ -837,14 +844,14 @@ async function processVideo(){
       bestLocalContour.intPtr(3,0)[0] = Math.round(x1);
       bestLocalContour.intPtr(3,0)[1] = Math.round(y2);
 
-  const score = calculateCardScore(bestLocalContour, {width: frameW, height: frameH});
+      const score = calculateCardScore(bestLocalContour, {width: frameW, height: frameH});
       
-      // Only calculate sharpness/reflection if score is good enough
+      // Only calculate sharpness/reflection if score AND ratio are good enough
       let sharpness = 0;
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
       let srcMatForThisFrame = null;
       let doExpensive = true;
-      if (score > scoreThreshold - 0.1 && doExpensive) { // Pre-filter by score
+      if (score > scoreThreshold - 0.1 && hasValidRatio && doExpensive) { // Add ratio check
         // Only create OpenCV Mat when needed (lazy)
         srcMatForThisFrame = cv.imread(reusableTempCanvas);
         const tS0 = performance.now();
@@ -861,32 +868,31 @@ async function processVideo(){
         }
       }
       
-  const isSharp = sharpness >= sharpnessThreshold; // only count when computed
+      const isSharp = sharpness >= sharpnessThreshold;
       const inFrame = isCardInFrame(bestLocalContour, guideBox);
       const hasReflection = reflectionData.hasReflection;
-      const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection;
+      const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection && hasValidRatio; // Add ratio check
 
-      // REMOVE OR COMMENT OUT THESE LINES (lines 405-410)
-      // const contourVec = new cv.MatVector();
-      // contourVec.push_back(bestLocalContour);
-      // const color = isGood ? new cv.Scalar(0,255,0,255) : 
-      //               inFrame ? new cv.Scalar(0,165,255,255) : 
-      //               new cv.Scalar(255,0,0,255);
-      // cv.drawContours(display, contourVec, 0, color, 2);
-      // contourVec.delete();
-
-  // Colors
-  const colorStr = isGood ? 'rgb(0,255,0)' : (inFrame ? 'rgb(255,165,0)' : 'rgb(255,0,0)');
-  outCtx.fillStyle = colorStr;
-  outCtx.font = '18px sans-serif';
-  outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
-  outCtx.fillStyle = (isSharp ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-  outCtx.font = '16px sans-serif';
-  outCtx.fillText(`Sharp: ${sharpness.toFixed(1)}`, 10, 60);
-  outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-  outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 90);
-  outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
-  outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 120);
+      // Colors - show red if ratio is invalid
+      const colorStr = isGood ? 'rgb(0,255,0)' : 
+                      (!hasValidRatio ? 'rgb(255,0,255)' : // Magenta for bad ratio
+                      (inFrame ? 'rgb(255,165,0)' : 'rgb(255,0,0)'));
+      outCtx.fillStyle = colorStr;
+      outCtx.font = '18px sans-serif';
+      outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
+      outCtx.fillStyle = (isSharp ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
+      outCtx.font = '16px sans-serif';
+      outCtx.fillText(`Sharp: ${sharpness.toFixed(1)}`, 10, 60);
+      outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
+      outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 90);
+      outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
+      outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 120);
+      
+      // Add ratio display
+      outCtx.fillStyle = (hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)');
+      outCtx.fillText(`Ratio: ${ratioCheck.ratio.toFixed(2)} (${ratioCheck.orientation})`, 10, 150);
+      outCtx.fillStyle = (hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)');
+      outCtx.fillText(`Expected: ${CARD_RATIO.toFixed(2)} ±${RATIO_TOLERANCE.toFixed(2)}`, 10, 180);
 
       if (isGood) {
         // Calculate quality score for comparison
@@ -918,10 +924,10 @@ async function processVideo(){
           stableCount++;
         }
         
-  outCtx.fillStyle = 'rgb(255,255,0)';
-  outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 150);
-  outCtx.fillStyle = 'rgb(0,255,255)';
-  outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 180);
+        outCtx.fillStyle = 'rgb(255,255,0)';
+        outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 210);
+        outCtx.fillStyle = 'rgb(0,255,255)';
+        outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 240);
 
         if (stableCount >= requiredStableFrames) {
           // Find best frame based on quality score (not just sharpness)
@@ -975,15 +981,16 @@ async function processVideo(){
         
         if (toggleBlurWarn.checked) {
           outCtx.fillStyle = 'rgb(255,0,0)';
-          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 180);
-          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 210);
-          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 240); }
-          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 270); }
+          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 270);
+          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 300);
+          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 330); }
+          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 360); }
+          if (!hasValidRatio) { outCtx.fillStyle = 'rgb(255,0,255)'; outCtx.fillText('Card shape not recognized - adjust angle', 10, 390); }
         }
       }
 
-      // Draw detection rectangle (Canvas 2D)
-      outCtx.strokeStyle = 'rgb(0,255,0)';
+      // Draw detection rectangle (Canvas 2D) - use magenta for invalid ratio
+      outCtx.strokeStyle = hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)';
       outCtx.lineWidth = 2;
       outCtx.strokeRect(Math.round(x1), Math.round(y1), Math.round(x2-x1), Math.round(y2-y1));
       bestLocalContour.delete();
@@ -1132,3 +1139,26 @@ document.addEventListener('visibilitychange', () => {
     scheduleNextFrame(processVideo);
   }
 });
+
+// New function to check aspect ratio of detected card
+function isValidCardRatio(box) {
+  const [x1, y1, x2, y2] = box;
+  const width = Math.abs(x2 - x1);
+  const height = Math.abs(y2 - y1);
+  
+  if (width === 0 || height === 0) return { isValid: false, ratio: 0, orientation: 'unknown' };
+  
+  // Calculate both possible ratios (landscape and portrait)
+  const ratio1 = width / height;  // landscape
+  const ratio2 = height / width;  // portrait
+  
+  // Check if either orientation matches card ratio within tolerance
+  const landscapeMatch = Math.abs(ratio1 - CARD_RATIO) <= RATIO_TOLERANCE;
+  const portraitMatch = Math.abs(ratio2 - CARD_RATIO) <= RATIO_TOLERANCE;
+  
+  const isValid = landscapeMatch || portraitMatch;
+  const actualRatio = ratio1 > ratio2 ? ratio1 : ratio2; // Use the larger ratio
+  const orientation = ratio1 > 1 ? 'landscape' : 'portrait';
+  
+  return { isValid, ratio: actualRatio, orientation };
+}

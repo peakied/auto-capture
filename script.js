@@ -105,27 +105,45 @@ if (document.readyState === 'loading') {
 
 async function startCamera() {
   try {
-    // Pick constraints suited for device
-    const constraints = 
-        {
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: "environment",
-            frameRate: { ideal: 30 }
-          },
-          audio: false
-        };
+    // Improved mobile-optimized constraints
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    
+    const constraints = {
+      video: {
+        width: { 
+          min: 640,
+          ideal: isMobile ? 1920 : 1280,  // Higher resolution for mobile
+          max: 4096 
+        },
+        height: { 
+          min: 480,
+          ideal: isMobile ? 1080 : 720,   // Higher resolution for mobile
+          max: 2160 
+        },
+        facingMode: "environment",
+        frameRate: { 
+          ideal: isMobile ? 24 : 30,      // Slightly lower FPS for better quality
+          max: 30 
+        },
+        // Add these for better quality on mobile
+        aspectRatio: { ideal: 16/9 },
+        focusMode: "continuous",
+        whiteBalanceMode: "continuous"
+      },
+      audio: false
+    };
 
     cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
     video.srcObject = cameraStream;
     video.play();
+    
     video.onloadedmetadata = () => {
-        // Wait for video to have actual dimensions
         setTimeout(() => {
             const w = video.videoWidth;
             const h = video.videoHeight;
-            console.log('After timeout - Video size:', w, h);
+            console.log('Video dimensions:', w, 'x', h);
+            console.log('Device type:', isMobile ? 'Mobile' : 'Desktop');
+            
             if (!w || !h) {
                 logStatus("Waiting for video size...");
                 setTimeout(video.onloadedmetadata, 100);
@@ -133,10 +151,10 @@ async function startCamera() {
             }
             initializeMats();
             isProcessing = true;
-            // Give one more frame delay before processing
             setTimeout(() => scheduleNextFrame(processVideo), 100);
         }, 200);
     };
+    
     streaming = true;
     toggleCameraBtn.textContent = "Stop Camera";
     logStatus("Camera started");
@@ -167,10 +185,17 @@ function initializeMats(){
   const w = video.videoWidth;
   console.log('Video dimensions:', w, 'x', h);
   
+  // Maintain original resolution for canvas
   canvasOutput.width = w;
   canvasOutput.height = h;
   
-  // Don't use VideoCapture, we'll capture from canvas instead
+  // Improve canvas rendering quality
+  const ctx = canvasOutput.getContext('2d');
+  ctx.imageSmoothingEnabled = false;  // Disable smoothing for sharper output
+  // Alternative: use high-quality smoothing
+  // ctx.imageSmoothingEnabled = true;
+  // ctx.imageSmoothingQuality = 'high';
+  
   cap = null;
   src = null;
   
@@ -752,27 +777,38 @@ async function runYoloOnCanvas(srcCanvas) {
 async function processVideo(){
   if (!isProcessing) return;
   
-  // Skip frames to reduce CPU load
+  // Reduce frame skipping on mobile for better quality
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  const skipFrames = isMobile ? 1 : 2;  // Process more frames on mobile
+  
   frameSkipCounter++;
-  if (frameSkipCounter % PROCESS_EVERY_N_FRAMES !== 0) {
+  if (frameSkipCounter % skipFrames !== 0) {
     scheduleNextFrame(processVideo);
     return;
   }
   
   try {
     const tFrame0 = performance.now();
-    // Reuse canvas instead of creating new one
+    
+    // Create high-quality canvas for mobile
     if (!reusableTempCanvas) {
       reusableTempCanvas = document.createElement('canvas');
     }
     reusableTempCanvas.width = video.videoWidth;
     reusableTempCanvas.height = video.videoHeight;
-    const tempCtx = reusableTempCanvas.getContext('2d', { willReadFrequently: true });
+    
+    const tempCtx = reusableTempCanvas.getContext('2d', { 
+      willReadFrequently: true,
+      alpha: false  // Better performance
+    });
+    
+    // Improve canvas rendering quality
+    tempCtx.imageSmoothingEnabled = false;  // Sharper on mobile
     tempCtx.drawImage(video, 0, 0, reusableTempCanvas.width, reusableTempCanvas.height);
 
-    // Draw base frame to output using Canvas 2D (avoid cv.imread for most frames)
+    // Draw to output with high quality settings
     const outCtx = canvasOutput.getContext('2d');
-    const tAfterGrab = performance.now();
+    outCtx.imageSmoothingEnabled = false;  // Maintain sharpness
     outCtx.drawImage(reusableTempCanvas, 0, 0);
 
     const frameW = reusableTempCanvas.width;

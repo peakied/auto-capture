@@ -18,7 +18,7 @@ let capturedFrame = null; // Store the captured frame
 // onnxruntime-web session for YOLO
 let ortSession = null;
 // Treat yoloInputShape as [N, C, H, W] (NCHW). Fixed for 160x160 model.
-let yoloInputShape = [1, 3, 160, 160];
+let yoloInputShape = [1, 3, 320, 320];
 let yoloInputName = null;
 let yoloProviders = [];
 const yoloScoreThresh = 0.25;   // fixed threshold
@@ -45,7 +45,7 @@ let yoloWorkerReady = false;
 let yoloRequestInFlight = false;
 let lastDetections = [];
 let lastYoloMs = 0;
-let modelPath = 'best160.onnx'; // auto-chosen model
+let modelPath = 'best320.onnx'; // auto-chosen model
 
 // Lightweight profiling toggles/holders
 let PROFILE = true; // set false to disable timing updates

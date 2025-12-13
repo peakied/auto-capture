@@ -27,7 +27,6 @@ const yoloNmsIouThresh = 0.45; // NMS IoU threshold
 const scoreThreshold = 0.60; // card positioning threshold (our combined score)
 const sharpnessThreshold = 35; // Slightly lower for more flexibility
 const requiredStableFrames = 15; // Increase to get more samples
-const inFrameThreshold = 0.7;
 let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
 const historySize = 10; // Increase history size to capture more frames
@@ -266,24 +265,7 @@ function contourToMat(contourPts){
   return mat;
 }
 
-function isCardInFrame(cardContour, frameBox) {
-  // ตรวจสอบว่าบัตรอยู่ในกรอบหรือไม่
-  if (!cardContour || cardContour.rows !== 4) return false;
-  
-  let pointsInside = 0;
-  for (let i = 0; i < 4; i++) {
-    const x = cardContour.intAt(i, 0);
-    const y = cardContour.intAt(i, 1);
-    
-    if (x >= frameBox.x && x <= frameBox.x + frameBox.width &&
-        y >= frameBox.y && y <= frameBox.y + frameBox.height) {
-      pointsInside++;
-    }
-  }
-  
-  // อย่างน้อย 3 ใน 4 มุมต้องอยู่ในกรอบ
-  return pointsInside >= 3;
-}
+
 
 function calculateCardScore(contour, frameShape){
   const frameArea = frameShape.height * frameShape.width;
@@ -772,33 +754,6 @@ async function processVideo(){
 
     const frameW = reusableTempCanvas.width;
     const frameH = reusableTempCanvas.height;
-    const card_ratio = 86 / 54;
-    
-    let guideWidth = Math.floor(frameW * 0.7);
-    let guideHeight = Math.floor(guideWidth / card_ratio);
-    
-    if (guideHeight > frameH * 0.8) {
-      guideHeight = Math.floor(frameH * 0.8);
-      guideWidth = Math.floor(guideHeight * card_ratio);
-    }
-    
-    const guideX = Math.floor((frameW - guideWidth) / 2);
-    const guideY = Math.floor((frameH - guideHeight) / 2);
-    
-    const guideBox = {
-      x: guideX,
-      y: guideY,
-      width: guideWidth,
-      height: guideHeight
-    };
-    
-  // Draw guide box and hint text with Canvas 2D
-  outCtx.strokeStyle = 'rgb(100,100,100)';
-  outCtx.lineWidth = 2;
-  outCtx.strokeRect(guideX, guideY, guideWidth, guideHeight);
-  outCtx.fillStyle = 'rgb(100,100,100)';
-  outCtx.font = '16px sans-serif';
-  outCtx.fillText('Align card here', guideX + 10, Math.max(20, guideY - 10));
 
     // === YOLO detection instead of Canny/contours ===
     let detections = [];
@@ -860,10 +815,8 @@ async function processVideo(){
       }
       
   const isSharp = sharpness >= sharpnessThreshold; // only count when computed
-      const inFrame = isCardInFrame(bestLocalContour, guideBox);
       const hasReflection = reflectionData.hasReflection;
-      const isGood = (score > scoreThreshold) && isSharp && inFrame && !hasReflection;
-
+      const isGood = (score > scoreThreshold) && isSharp && !hasReflection;
       // REMOVE OR COMMENT OUT THESE LINES (lines 405-410)
       // const contourVec = new cv.MatVector();
       // contourVec.push_back(bestLocalContour);
@@ -874,17 +827,15 @@ async function processVideo(){
       // contourVec.delete();
 
   // Colors
-  const colorStr = isGood ? 'rgb(0,255,0)' : (inFrame ? 'rgb(255,165,0)' : 'rgb(255,0,0)');
+  const colorStr = isGood ? 'rgb(0,255,0)' : 'rgb(255,165,0)';
   outCtx.fillStyle = colorStr;
   outCtx.font = '18px sans-serif';
   outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
   outCtx.fillStyle = (isSharp ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
   outCtx.font = '16px sans-serif';
   outCtx.fillText(`Sharp: ${sharpness.toFixed(1)}`, 10, 60);
-  outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-  outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 90);
   outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
-  outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 120);
+  outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 90);
 
       if (isGood) {
         // Calculate quality score for comparison
@@ -917,9 +868,9 @@ async function processVideo(){
         }
         
   outCtx.fillStyle = 'rgb(255,255,0)';
-  outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 150);
+  outCtx.fillText(`Quality: ${qualityScore.toFixed(2)}`, 10, 120);
   outCtx.fillStyle = 'rgb(0,255,255)';
-  outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 180);
+  outCtx.fillText(`Stable: ${stableCount}/${requiredStableFrames}`, 10, 150);
 
         if (stableCount >= requiredStableFrames) {
           // Find best frame based on quality score (not just sharpness)
@@ -973,10 +924,9 @@ async function processVideo(){
         
         if (toggleBlurWarn.checked) {
           outCtx.fillStyle = 'rgb(255,0,0)';
-          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 180);
-          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 210);
-          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 240); }
-          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 270); }
+          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 180);
+          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 210); }
+          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 240); }
         }
       }
 

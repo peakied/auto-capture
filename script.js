@@ -7,9 +7,6 @@ let toggleBlurWarn = document.getElementById('toggleBlurWarn');
 let toggleCameraBtn = document.getElementById('toggleCameraBtn');
 
 let streaming = false;
-let src = null, gray = null, blurred = null;
-let contours = null, hierarchy = null;
-let cap = null;
 let bestCropped = null;
 let cameraStream = null;
 let isProcessing = false;
@@ -33,12 +30,11 @@ let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
 const historySize = 10; // Increase history size to capture more frames
 
-// Add at top with other variables
+// Frame processing variables
 let frameSkipCounter = 0;
 let PROCESS_EVERY_N_FRAMES = 2;
-let EXPENSIVE_CHECK_EVERY_N = 2;
-let reusableTempCanvas = null; // Reuse canvas
-let yoloCanvas = null; // For letterbox preprocessing
+let reusableTempCanvas = null;
+let yoloCanvas = null;
 
 // Worker-based YOLO offload
 let yoloWorker = null;
@@ -182,31 +178,12 @@ function initializeMats(){
   const w = video.videoWidth;
   console.log('Video dimensions:', w, 'x', h);
   
-  // Maintain original resolution for canvas
   canvasOutput.width = w;
   canvasOutput.height = h;
   
-  // Improve canvas rendering quality
   const ctx = canvasOutput.getContext('2d');
-  ctx.imageSmoothingEnabled = false;  // Disable smoothing for sharper output
-  // Alternative: use high-quality smoothing
-  // ctx.imageSmoothingEnabled = true;
-  // ctx.imageSmoothingQuality = 'high';
-  
-  cap = null;
-  src = null;
-  
-  gray = new cv.Mat();
-  blurred = new cv.Mat();
-  contours = new cv.MatVector();
-  hierarchy = new cv.Mat();
-  
-  console.log('Mats initialized');
+  ctx.imageSmoothingEnabled = false;
 }
-
-function toDegree(rad){ return Math.abs(rad * 180.0 / Math.PI); }
-
-// --- helper conversions of your Python functions ---
 
 function detectReflection(frameMatColor, contour) {
   // Fast reflection check on bbox ROI
@@ -258,16 +235,6 @@ function detectReflection(frameMatColor, contour) {
     reflectionRatio,
     hasSpikeReflection
   };
-}
-
-function contourToMat(contourPts){
-  // contourPts = JS array of {x,y}
-  const mat = new cv.Mat(contourPts.length, 1, cv.CV_32SC2);
-  for (let i=0;i<contourPts.length;i++){
-    mat.intPtr(i,0)[0] = contourPts[i].x;
-    mat.intPtr(i,0)[1] = contourPts[i].y;
-  }
-  return mat;
 }
 
 function calculateCardScore(contour, frameShape){
@@ -364,7 +331,7 @@ function calculateQualityScore(score, reflectionRatio, sharpness) {
 }
 
 function sharpenImage(mat) {
-  // Apply sharpening filter เหมือนใน Python
+  // Apply sharpening filter
   const kernel = cv.matFromArray(3, 3, cv.CV_32FC1, [
     0, -1, 0,
     -1, 5, -1,
@@ -377,7 +344,6 @@ function sharpenImage(mat) {
 }
 
 function extractCardRegion(frameMat, contour){
-  // expects contour with 4 points (cv.CV_32SC2)
   if (contour.rows !== 4){
     const r = cv.boundingRect(contour);
     const padx = Math.floor(r.width * 0.05), pady = Math.floor(r.height * 0.05);
@@ -386,26 +352,25 @@ function extractCardRegion(frameMat, contour){
     return frameMat.roi(new cv.Rect(x,y,w,h)).clone();
   }
 
-  // Get the four corners
+  // Get the four corners and sort them: top-left, top-right, bottom-right, bottom-left
   let points = [];
   for (let i=0;i<4;i++){
     points.push([contour.intAt(i,0), contour.intAt(i,1)]);
   }
   
-  // Sort points properly: top-left, top-right, bottom-right, bottom-left
-  // ใช้วิธีที่แม่นยำกว่า โดยเรียงตาม y ก่อน แล้วค่อยเรียงตาม x
-  points.sort((a, b) => a[1] - b[1]); // เรียงตาม y
+  // Sort by y-coordinate first
+  points.sort((a, b) => a[1] - b[1]);
   
   let rect = new Array(4);
-  // 2 จุดบนสุด
+  // Top two points
   let topPoints = [points[0], points[1]];
-  topPoints.sort((a, b) => a[0] - b[0]); // เรียงตาม x
+  topPoints.sort((a, b) => a[0] - b[0]);
   rect[0] = topPoints[0]; // top-left
   rect[1] = topPoints[1]; // top-right
   
-  // 2 จุดล่างสุด
+  // Bottom two points
   let bottomPoints = [points[2], points[3]];
-  bottomPoints.sort((a, b) => a[0] - b[0]); // เรียงตาม x
+  bottomPoints.sort((a, b) => a[0] - b[0]);
   rect[3] = bottomPoints[0]; // bottom-left
   rect[2] = bottomPoints[1]; // bottom-right
   
@@ -421,7 +386,7 @@ function extractCardRegion(frameMat, contour){
     rect[i][1] = center_y + direction_y * expansion_factor;
   }
   
-  // คำนวณความกว้างและความสูงจริงของการ์ด
+  // Calculate actual card dimensions
   const width_top = Math.sqrt(Math.pow(rect[1][0] - rect[0][0], 2) + Math.pow(rect[1][1] - rect[0][1], 2));
   const width_bottom = Math.sqrt(Math.pow(rect[2][0] - rect[3][0], 2) + Math.pow(rect[2][1] - rect[3][1], 2));
   const width = Math.max(width_top, width_bottom);
@@ -430,10 +395,10 @@ function extractCardRegion(frameMat, contour){
   const height_right = Math.sqrt(Math.pow(rect[2][0] - rect[1][0], 2) + Math.pow(rect[2][1] - rect[1][1], 2));
   const height = Math.max(height_left, height_right);
   
-  // อัตราส่วนมาตรฐานของการ์ด
+  // Standard card ratio (86mm / 54mm)
   const card_ratio = 86 / 54;
   
-  // คำนวณขนาดสุดท้าย
+  // Calculate final dimensions
   let finalWidth = Math.floor(width);
   let finalHeight = Math.floor(height);
   
@@ -464,7 +429,7 @@ function extractCardRegion(frameMat, contour){
     0, finalHeight - 1
   ]);
   
-  // Source points (ตรงตามลำดับ: TL, TR, BR, BL)
+  // Source points: TL, TR, BR, BL
   const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
     rect[0][0], rect[0][1],  // top-left
     rect[1][0], rect[1][1],  // top-right
@@ -572,7 +537,7 @@ async function initYolo() {
   yoloCanvas.width = yoloInputShape[3];
   yoloCanvas.height = yoloInputShape[2];
 
-  console.log('YOLO main-thread initialized (fixed 160x160):', { providers: yoloProviders, inputName: yoloInputName, inputShape: yoloInputShape, modelPath, yoloScoreThresh });
+  console.log('YOLO initialized:', { providers: yoloProviders, inputName: yoloInputName, inputShape: yoloInputShape, modelPath, scoreThresh: yoloScoreThresh });
 }
 
 function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114,255]) {
@@ -1020,12 +985,11 @@ async function processVideo(){
     }
     
     const tD0 = performance.now();
-    // We already drew to outCtx; treat the overlay duration as draw time
     const tD1 = performance.now();
-    if (PROFILE) lastProfile.drawMs = tD1 - tD0;
     if (PROFILE) {
-      lastProfile.grabMs = tAfterGrab - tFrame0;
-      lastProfile.yoloMs = lastYoloMs || (tAfterYolo - tAfterGrab);
+      lastProfile.drawMs = tD1 - tD0;
+      lastProfile.grabMs = tAfterYolo - tFrame0;
+      lastProfile.yoloMs = lastYoloMs || 0;
       lastProfile.totalMs = (performance.now() - tFrame0);
       // Log occasionally to avoid spamming
       if ((window.__profTick = (window.__profTick||0)+1) % 30 === 0) {
@@ -1068,7 +1032,7 @@ async function processVideo(){
 toggleCameraBtn.addEventListener('click', () => {
   if (streaming) {
     stopCamera();
-    // ล้างประวัติเมื่อหยุด
+    // Clear frame history
     frameHistory.forEach(f => {
       f.frame.delete();
       f.contour.delete();
@@ -1088,54 +1052,42 @@ toggleCameraBtn.addEventListener('click', () => {
   }
 });
 
-// Crop button - extract card from captured frame
+// Crop and save the detected card
 saveBtn.addEventListener('click', ()=>{
   if (!capturedFrame || !bestContour) { 
     alert("No card detected yet. Please capture a card first."); 
     return; 
   }
   
-  // Extract the card region จากภาพต้นฉบับที่ไม่มีกรอบ (capturedFrame)
   if (bestCropped) bestCropped.delete();
   bestCropped = extractCardRegion(capturedFrame, bestContour);
   
-  // Show the cropped and sharpened card (ไม่มีกรอบเขียว)
   cv.imshow(canvasOutput, bestCropped);
   logStatus("Card cropped and sharpened! Downloading...");
   
-  // Auto-download - Create a temporary canvas for clean output
   setTimeout(() => {
-    // Create a temporary canvas to ensure clean output
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = bestCropped.cols;
     tempCanvas.height = bestCropped.rows;
-    const tempCtx = tempCanvas.getContext('2d');
     
-    // Draw the clean cropped image to temp canvas
     cv.imshow(tempCanvas, bestCropped);
     
-    // Download from temp canvas
     const link = document.createElement('a');
     link.download = 'cropped_card.png';
-    link.href = tempCanvas.toDataURL('image/png', 1.0); // คุณภาพสูงสุด
+    link.href = tempCanvas.toDataURL('image/png', 1.0);
     link.click();
     
     logStatus("Card saved! Click 'Start Camera' to capture another card.");
   }, 100);
 });                                                                              
 
-// cleanup when page unloads
+// Cleanup when page unloads
 window.addEventListener('unload', ()=>{
   stopCamera();
   try {
-    if (src) src.delete();
-    if (gray) gray.delete();
-    if (blurred) blurred.delete();
-    if (contours) contours.delete();
-    if (hierarchy) hierarchy.delete();
     if (bestContour) bestContour.delete();
     if (bestCropped) bestCropped.delete();
-    if (cap) cap.delete();
+    if (capturedFrame) capturedFrame.delete();
     if (yoloWorker) { yoloWorker.terminate(); yoloWorker = null; }
   } catch(e){}
 });
@@ -1150,7 +1102,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// New function to check aspect ratio of detected card
+// Check if detected box has valid card aspect ratio
 function isValidCardRatio(box) {
   const [x1, y1, x2, y2] = box;
   const width = Math.abs(x2 - x1);
@@ -1158,11 +1110,10 @@ function isValidCardRatio(box) {
   
   if (width === 0 || height === 0) return { isValid: false, ratio: 0, orientation: 'unknown' };
   
-  // Calculate both possible ratios (landscape and portrait)
-  const ratio1 = width / height;  // landscape
-  const ratio2 = height / width;  // portrait
+  const ratio1 = width / height;
+  const ratio2 = height / width;
   
-  // Check if either orientation matches card ratio within tolerance
+  // Check both landscape and portrait orientations
   const landscapeMatch = Math.abs(ratio1 - CARD_RATIO) <= RATIO_TOLERANCE;
   const portraitMatch = Math.abs(ratio2 - CARD_RATIO) <= RATIO_TOLERANCE;
   

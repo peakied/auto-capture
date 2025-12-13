@@ -106,6 +106,7 @@ async function startCamera() {
     const constraints = 
         {
           video: {
+            facingMode: "environment",
             frameRate: { ideal: 30 }
           },
           audio: false

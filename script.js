@@ -18,7 +18,7 @@ let capturedFrame = null; // Store the captured frame
 // onnxruntime-web session for YOLO
 let ortSession = null;
 // Treat yoloInputShape as [N, C, H, W] (NCHW). Fixed for 160x160 model.
-let yoloInputShape = [1, 3, 160, 160];
+let yoloInputShape = [1, 3, 320, 320];
 let yoloInputName = null;
 let yoloProviders = [];
 const yoloScoreThresh = 0.25;   // fixed threshold
@@ -47,7 +47,7 @@ let yoloWorkerReady = false;
 let yoloRequestInFlight = false;
 let lastDetections = [];
 let lastYoloMs = 0;
-let modelPath = 'best160.onnx'; // auto-chosen model
+let modelPath = 'best320.onnx'; // auto-chosen model
 
 // Lightweight profiling toggles/holders
 let PROFILE = true; // set false to disable timing updates
@@ -271,24 +271,7 @@ function contourToMat(contourPts){
   return mat;
 }
 
-function isCardInFrame(cardContour, frameBox) {
-  // ตรวจสอบว่าบัตรอยู่ในกรอบหรือไม่
-  if (!cardContour || cardContour.rows !== 4) return false;
-  
-  let pointsInside = 0;
-  for (let i = 0; i < 4; i++) {
-    const x = cardContour.intAt(i, 0);
-    const y = cardContour.intAt(i, 1);
-    
-    if (x >= frameBox.x && x <= frameBox.x + frameBox.width &&
-        y >= frameBox.y && y <= frameBox.y + frameBox.height) {
-      pointsInside++;
-    }
-  }
-  
-  // อย่างน้อย 3 ใน 4 มุมต้องอยู่ในกรอบ
-  return pointsInside >= 3;
-}
+
 
 function calculateCardScore(contour, frameShape){
   const frameArea = frameShape.height * frameShape.width;
@@ -787,33 +770,6 @@ async function processVideo(){
 
     const frameW = reusableTempCanvas.width;
     const frameH = reusableTempCanvas.height;
-    const card_ratio = 86 / 54;
-    
-    let guideWidth = Math.floor(frameW * 0.7);
-    let guideHeight = Math.floor(guideWidth / card_ratio);
-    
-    if (guideHeight > frameH * 0.8) {
-      guideHeight = Math.floor(frameH * 0.8);
-      guideWidth = Math.floor(guideHeight * card_ratio);
-    }
-    
-    const guideX = Math.floor((frameW - guideWidth) / 2);
-    const guideY = Math.floor((frameH - guideHeight) / 2);
-    
-    const guideBox = {
-      x: guideX,
-      y: guideY,
-      width: guideWidth,
-      height: guideHeight
-    };
-    
-  // Draw guide box and hint text with Canvas 2D
-  outCtx.strokeStyle = 'rgb(100,100,100)';
-  outCtx.lineWidth = 2;
-  outCtx.strokeRect(guideX, guideY, guideWidth, guideHeight);
-  outCtx.fillStyle = 'rgb(100,100,100)';
-  outCtx.font = '16px sans-serif';
-  outCtx.fillText('Align card here', guideX + 10, Math.max(20, guideY - 10));
 
     // === YOLO detection instead of Canny/contours ===
     let detections = [];
@@ -870,29 +826,28 @@ async function processVideo(){
         if (PROFILE) lastProfile.reflMs = tR1 - tR0;
       }
       
-      const inFrame = isCardInFrame(bestLocalContour, guideBox);
+  const isSharp = sharpness >= sharpnessThreshold; // only count when computed
       const hasReflection = reflectionData.hasReflection;
-      const isGood = (score > scoreThreshold) && inFrame && !hasReflection && hasValidRatio; // Remove sharpness check
+      const isGood = (score > scoreThreshold) && isSharp && !hasReflection;
+      // REMOVE OR COMMENT OUT THESE LINES (lines 405-410)
+      // const contourVec = new cv.MatVector();
+      // contourVec.push_back(bestLocalContour);
+      // const color = isGood ? new cv.Scalar(0,255,0,255) : 
+      //               inFrame ? new cv.Scalar(0,165,255,255) : 
+      //               new cv.Scalar(255,0,0,255);
+      // cv.drawContours(display, contourVec, 0, color, 2);
+      // contourVec.delete();
 
-      // Colors - show red if ratio is invalid
-      const colorStr = isGood ? 'rgb(0,255,0)' : 
-                      (!hasValidRatio ? 'rgb(255,0,255)' : // Magenta for bad ratio
-                      (inFrame ? 'rgb(255,165,0)' : 'rgb(255,0,0)'));
-      outCtx.fillStyle = colorStr;
-      outCtx.font = '18px sans-serif';
-      outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
-      // Remove sharpness display
-      outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-      outCtx.font = '16px sans-serif';
-      outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 60);
-      outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
-      outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 90);
-      
-      // Add ratio display
-      outCtx.fillStyle = (hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)');
-      outCtx.fillText(`Ratio: ${ratioCheck.ratio.toFixed(2)} (${ratioCheck.orientation})`, 10, 120);
-      outCtx.fillStyle = (hasValidRatio ? 'rgb(0,255,0)' : 'rgb(255,0,255)');
-      outCtx.fillText(`Expected: ${CARD_RATIO.toFixed(2)} ±${RATIO_TOLERANCE.toFixed(2)}`, 10, 150);
+  // Colors
+  const colorStr = isGood ? 'rgb(0,255,0)' : 'rgb(255,165,0)';
+  outCtx.fillStyle = colorStr;
+  outCtx.font = '18px sans-serif';
+  outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
+  outCtx.fillStyle = (isSharp ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
+  outCtx.font = '16px sans-serif';
+  outCtx.fillText(`Sharp: ${sharpness.toFixed(1)}`, 10, 60);
+  outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
+  outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 90);
 
       if (isGood) {
         // Calculate quality score for comparison - remove sharpness parameter
@@ -979,10 +934,9 @@ async function processVideo(){
         
         if (toggleBlurWarn.checked) {
           outCtx.fillStyle = 'rgb(255,0,0)';
-          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 240);
-          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 270); }
-          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 300); }
-          if (!hasValidRatio) { outCtx.fillStyle = 'rgb(255,0,255)'; outCtx.fillText('Card shape not recognized - adjust angle', 10, 330); }
+          if (!isSharp) outCtx.fillText('Image too blurry - hold steady', 10, 180);
+          if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 210); }
+          if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 240); }
         }
       }
 

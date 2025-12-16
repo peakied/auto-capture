@@ -841,7 +841,7 @@ async function processVideo(){
       }
       
       const hasReflection = reflectionData.hasReflection;
-      const hasGoodSharpness = sharpnessData.variance >= 8000; // Require variance of at least 10000
+      const hasGoodSharpness = sharpnessData.variance >= 2000;
       const isGood = (score > scoreThreshold) && !hasReflection && hasValidRatio && hasGoodSharpness;
 
       // Colors - show status with color coding

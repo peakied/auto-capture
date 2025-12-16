@@ -7,12 +7,12 @@
 
 let ortLoaded = false;
 let ortSession = null;
-let yoloInputShape = [1, 3, 160, 160]; // NCHW (fixed for 160x160)
+let yoloInputShape = [1, 3, 320, 320]; // NCHW (fixed for 320x320)
 let yoloInputName = null;
 let providers = [];
 let yoloScoreThresh = 0.4;
 let yoloNmsIouThresh = 0.45;
-const modelPath = 'best160.onnx';
+const modelPath = 'best320.onnx';
 
 // Utility
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }

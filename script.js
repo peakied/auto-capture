@@ -7,9 +7,6 @@ let toggleBlurWarn = document.getElementById('toggleBlurWarn');
 let toggleCameraBtn = document.getElementById('toggleCameraBtn');
 
 let streaming = false;
-let src = null, gray = null, blurred = null;
-let contours = null, hierarchy = null;
-let cap = null;
 let bestCropped = null;
 let cameraStream = null;
 let isProcessing = false;
@@ -18,7 +15,7 @@ let capturedFrame = null; // Store the captured frame
 // onnxruntime-web session for YOLO
 let ortSession = null;
 // Treat yoloInputShape as [N, C, H, W] (NCHW). Fixed for 160x160 model.
-let yoloInputShape = [1, 3, 160, 160];
+let yoloInputShape = [1, 3, 320, 320];
 let yoloInputName = null;
 let yoloProviders = [];
 const yoloScoreThresh = 0.25;   // fixed threshold
@@ -26,7 +23,6 @@ const yoloNmsIouThresh = 0.45; // NMS IoU threshold
 
 const scoreThreshold = 0.60; // card positioning threshold (our combined score)
 const requiredStableFrames = 15; // Increase to get more samples
-const inFrameThreshold = 0.7;
 // Add aspect ratio constants
 const CARD_RATIO = 1.59; // Standard card ratio (86mm / 54mm)
 const RATIO_TOLERANCE = 0.15; // Allow 15% deviation from standard ratio
@@ -34,12 +30,11 @@ let stableCount = 0, bestScore = 0.0, bestContour = null;
 let frameHistory = [];
 const historySize = 10; // Increase history size to capture more frames
 
-// Add at top with other variables
+// Frame processing variables
 let frameSkipCounter = 0;
 let PROCESS_EVERY_N_FRAMES = 2;
-let EXPENSIVE_CHECK_EVERY_N = 2;
-let reusableTempCanvas = null; // Reuse canvas
-let yoloCanvas = null; // For letterbox preprocessing
+let reusableTempCanvas = null;
+let yoloCanvas = null;
 
 // Worker-based YOLO offload
 let yoloWorker = null;
@@ -47,7 +42,7 @@ let yoloWorkerReady = false;
 let yoloRequestInFlight = false;
 let lastDetections = [];
 let lastYoloMs = 0;
-let modelPath = 'best160.onnx'; // auto-chosen model
+let modelPath = 'best320.onnx'; // auto-chosen model
 
 // Lightweight profiling toggles/holders
 let PROFILE = true; // set false to disable timing updates
@@ -183,31 +178,12 @@ function initializeMats(){
   const w = video.videoWidth;
   console.log('Video dimensions:', w, 'x', h);
   
-  // Maintain original resolution for canvas
   canvasOutput.width = w;
   canvasOutput.height = h;
   
-  // Improve canvas rendering quality
   const ctx = canvasOutput.getContext('2d');
-  ctx.imageSmoothingEnabled = false;  // Disable smoothing for sharper output
-  // Alternative: use high-quality smoothing
-  // ctx.imageSmoothingEnabled = true;
-  // ctx.imageSmoothingQuality = 'high';
-  
-  cap = null;
-  src = null;
-  
-  gray = new cv.Mat();
-  blurred = new cv.Mat();
-  contours = new cv.MatVector();
-  hierarchy = new cv.Mat();
-  
-  console.log('Mats initialized');
+  ctx.imageSmoothingEnabled = false;
 }
-
-function toDegree(rad){ return Math.abs(rad * 180.0 / Math.PI); }
-
-// --- helper conversions of your Python functions ---
 
 function detectReflection(frameMatColor, contour) {
   // Fast reflection check on bbox ROI
@@ -261,35 +237,6 @@ function detectReflection(frameMatColor, contour) {
   };
 }
 
-function contourToMat(contourPts){
-  // contourPts = JS array of {x,y}
-  const mat = new cv.Mat(contourPts.length, 1, cv.CV_32SC2);
-  for (let i=0;i<contourPts.length;i++){
-    mat.intPtr(i,0)[0] = contourPts[i].x;
-    mat.intPtr(i,0)[1] = contourPts[i].y;
-  }
-  return mat;
-}
-
-function isCardInFrame(cardContour, frameBox) {
-  // ตรวจสอบว่าบัตรอยู่ในกรอบหรือไม่
-  if (!cardContour || cardContour.rows !== 4) return false;
-  
-  let pointsInside = 0;
-  for (let i = 0; i < 4; i++) {
-    const x = cardContour.intAt(i, 0);
-    const y = cardContour.intAt(i, 1);
-    
-    if (x >= frameBox.x && x <= frameBox.x + frameBox.width &&
-        y >= frameBox.y && y <= frameBox.y + frameBox.height) {
-      pointsInside++;
-    }
-  }
-  
-  // อย่างน้อย 3 ใน 4 มุมต้องอยู่ในกรอบ
-  return pointsInside >= 3;
-}
-
 function calculateCardScore(contour, frameShape){
   const frameArea = frameShape.height * frameShape.width;
   const cardArea = cv.contourArea(contour);
@@ -327,16 +274,64 @@ function calculateCardScore(contour, frameShape){
   return (areaScore * 0.25 + centerScore * 0.35 + straightnessScore * 0.40);
 }
 
-// New function to calculate combined quality score - remove sharpness parameter
-function calculateQualityScore(score, reflectionRatio) {
-  const reflectionPenalty = Math.max(0, 1.0 - (reflectionRatio * 2)); // Penalize reflection
+// Calculate image sharpness using Laplacian variance
+function calculateSharpness(mat, contour) {
+  try {
+    // Extract ROI around the card for faster processing
+    const rect = cv.boundingRect(contour);
+    const rx = Math.max(0, rect.x);
+    const ry = Math.max(0, rect.y);
+    const rw = Math.max(1, Math.min(mat.cols - rx, rect.width));
+    const rh = Math.max(1, Math.min(mat.rows - ry, rect.height));
+    
+    const roi = mat.roi(new cv.Rect(rx, ry, rw, rh));
+    const gray = new cv.Mat();
+    cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
+    
+    // Apply Laplacian operator to detect edges
+    const laplacian = new cv.Mat();
+    cv.Laplacian(gray, laplacian, cv.CV_64F, 3, 1, 0, cv.BORDER_DEFAULT);
+    
+    // Calculate variance of Laplacian (higher = sharper)
+    const mean = new cv.Mat();
+    const stddev = new cv.Mat();
+    cv.meanStdDev(laplacian, mean, stddev);
+    const variance = Math.pow(stddev.doubleAt(0, 0), 2);
+    
+    // Cleanup
+    roi.delete();
+    gray.delete();
+    laplacian.delete();
+    mean.delete();
+    stddev.delete();
+    
+    // Normalize variance to 0-1 range with high threshold for sharp images
+    // Excellent: >10000, Good: 5000-10000, Poor: <5000
+    const normalizedSharpness = Math.min(1.0, variance / 10000);
+    
+    return {
+      variance: variance,
+      normalized: normalizedSharpness,
+      quality: variance > 10000 ? 'excellent' : variance > 5000 ? 'good' : 'poor'
+    };
+  } catch (e) {
+    console.error('Sharpness calculation error:', e);
+    return { variance: 0, normalized: 0, quality: 'unknown' };
+  }
+}
+
+// Calculate combined quality score with sharpness, positioning, and reflection
+function calculateQualityScore(score, reflectionRatio, sharpness) {
+  const reflectionPenalty = Math.max(0, 1.0 - (reflectionRatio * 2));
+  const sharpnessScore = sharpness || 0;
   
-  // Combined quality: 70% positioning, 30% reflection penalty
-  return (score * 0.70) + (reflectionPenalty * 0.30);
+  // Combined quality: 40% positioning, 35% sharpness, 25% reflection penalty
+  // This balances all three critical factors
+  return (score * 0.40) + (sharpnessScore * 0.35) + (reflectionPenalty * 0.25);
 }
 
 function sharpenImage(mat) {
-  // Apply sharpening filter เหมือนใน Python
+  // Apply sharpening filter
   const kernel = cv.matFromArray(3, 3, cv.CV_32FC1, [
     0, -1, 0,
     -1, 5, -1,
@@ -349,7 +344,6 @@ function sharpenImage(mat) {
 }
 
 function extractCardRegion(frameMat, contour){
-  // expects contour with 4 points (cv.CV_32SC2)
   if (contour.rows !== 4){
     const r = cv.boundingRect(contour);
     const padx = Math.floor(r.width * 0.05), pady = Math.floor(r.height * 0.05);
@@ -358,26 +352,25 @@ function extractCardRegion(frameMat, contour){
     return frameMat.roi(new cv.Rect(x,y,w,h)).clone();
   }
 
-  // Get the four corners
+  // Get the four corners and sort them: top-left, top-right, bottom-right, bottom-left
   let points = [];
   for (let i=0;i<4;i++){
     points.push([contour.intAt(i,0), contour.intAt(i,1)]);
   }
   
-  // Sort points properly: top-left, top-right, bottom-right, bottom-left
-  // ใช้วิธีที่แม่นยำกว่า โดยเรียงตาม y ก่อน แล้วค่อยเรียงตาม x
-  points.sort((a, b) => a[1] - b[1]); // เรียงตาม y
+  // Sort by y-coordinate first
+  points.sort((a, b) => a[1] - b[1]);
   
   let rect = new Array(4);
-  // 2 จุดบนสุด
+  // Top two points
   let topPoints = [points[0], points[1]];
-  topPoints.sort((a, b) => a[0] - b[0]); // เรียงตาม x
+  topPoints.sort((a, b) => a[0] - b[0]);
   rect[0] = topPoints[0]; // top-left
   rect[1] = topPoints[1]; // top-right
   
-  // 2 จุดล่างสุด
+  // Bottom two points
   let bottomPoints = [points[2], points[3]];
-  bottomPoints.sort((a, b) => a[0] - b[0]); // เรียงตาม x
+  bottomPoints.sort((a, b) => a[0] - b[0]);
   rect[3] = bottomPoints[0]; // bottom-left
   rect[2] = bottomPoints[1]; // bottom-right
   
@@ -393,7 +386,7 @@ function extractCardRegion(frameMat, contour){
     rect[i][1] = center_y + direction_y * expansion_factor;
   }
   
-  // คำนวณความกว้างและความสูงจริงของการ์ด
+  // Calculate actual card dimensions
   const width_top = Math.sqrt(Math.pow(rect[1][0] - rect[0][0], 2) + Math.pow(rect[1][1] - rect[0][1], 2));
   const width_bottom = Math.sqrt(Math.pow(rect[2][0] - rect[3][0], 2) + Math.pow(rect[2][1] - rect[3][1], 2));
   const width = Math.max(width_top, width_bottom);
@@ -402,10 +395,10 @@ function extractCardRegion(frameMat, contour){
   const height_right = Math.sqrt(Math.pow(rect[2][0] - rect[1][0], 2) + Math.pow(rect[2][1] - rect[1][1], 2));
   const height = Math.max(height_left, height_right);
   
-  // อัตราส่วนมาตรฐานของการ์ด
+  // Standard card ratio (86mm / 54mm)
   const card_ratio = 86 / 54;
   
-  // คำนวณขนาดสุดท้าย
+  // Calculate final dimensions
   let finalWidth = Math.floor(width);
   let finalHeight = Math.floor(height);
   
@@ -436,7 +429,7 @@ function extractCardRegion(frameMat, contour){
     0, finalHeight - 1
   ]);
   
-  // Source points (ตรงตามลำดับ: TL, TR, BR, BL)
+  // Source points: TL, TR, BR, BL
   const srcPts = cv.matFromArray(4, 1, cv.CV_32FC2, [
     rect[0][0], rect[0][1],  // top-left
     rect[1][0], rect[1][1],  // top-right
@@ -544,7 +537,7 @@ async function initYolo() {
   yoloCanvas.width = yoloInputShape[3];
   yoloCanvas.height = yoloInputShape[2];
 
-  console.log('YOLO main-thread initialized (fixed 160x160):', { providers: yoloProviders, inputName: yoloInputName, inputShape: yoloInputShape, modelPath, yoloScoreThresh });
+  console.log('YOLO initialized:', { providers: yoloProviders, inputName: yoloInputName, inputShape: yoloInputShape, modelPath, scoreThresh: yoloScoreThresh });
 }
 
 function letterboxToCanvas(srcCanvas, dstCanvas, dstW, dstH, fill = [114,114,114,255]) {
@@ -787,33 +780,6 @@ async function processVideo(){
 
     const frameW = reusableTempCanvas.width;
     const frameH = reusableTempCanvas.height;
-    const card_ratio = 86 / 54;
-    
-    let guideWidth = Math.floor(frameW * 0.7);
-    let guideHeight = Math.floor(guideWidth / card_ratio);
-    
-    if (guideHeight > frameH * 0.8) {
-      guideHeight = Math.floor(frameH * 0.8);
-      guideWidth = Math.floor(guideHeight * card_ratio);
-    }
-    
-    const guideX = Math.floor((frameW - guideWidth) / 2);
-    const guideY = Math.floor((frameH - guideHeight) / 2);
-    
-    const guideBox = {
-      x: guideX,
-      y: guideY,
-      width: guideWidth,
-      height: guideHeight
-    };
-    
-  // Draw guide box and hint text with Canvas 2D
-  outCtx.strokeStyle = 'rgb(100,100,100)';
-  outCtx.lineWidth = 2;
-  outCtx.strokeRect(guideX, guideY, guideWidth, guideHeight);
-  outCtx.fillStyle = 'rgb(100,100,100)';
-  outCtx.font = '16px sans-serif';
-  outCtx.fillText('Align card here', guideX + 10, Math.max(20, guideY - 10));
 
     // === YOLO detection instead of Canny/contours ===
     let detections = [];
@@ -856,13 +822,17 @@ async function processVideo(){
 
       const score = calculateCardScore(bestLocalContour, {width: frameW, height: frameH});
       
-      // Only calculate reflection if score AND ratio are good enough - remove sharpness check
+      // Calculate sharpness and reflection if score AND ratio are good enough
       let reflectionData = { hasReflection: false, reflectionRatio: 0 };
+      let sharpnessData = { variance: 0, normalized: 0, quality: 'unknown' };
       let srcMatForThisFrame = null;
       let doExpensive = true;
-      if (score > scoreThreshold - 0.1 && hasValidRatio && doExpensive) { // Add ratio check
+      if (score > scoreThreshold - 0.1 && hasValidRatio && doExpensive) {
         // Only create OpenCV Mat when needed (lazy)
         srcMatForThisFrame = cv.imread(reusableTempCanvas);
+        
+        // Calculate sharpness first
+        sharpnessData = calculateSharpness(srcMatForThisFrame, bestLocalContour);
         
         const tR0 = performance.now();
         reflectionData = detectReflection(srcMatForThisFrame, bestLocalContour);
@@ -870,21 +840,23 @@ async function processVideo(){
         if (PROFILE) lastProfile.reflMs = tR1 - tR0;
       }
       
-      const inFrame = isCardInFrame(bestLocalContour, guideBox);
       const hasReflection = reflectionData.hasReflection;
-      const isGood = (score > scoreThreshold) && inFrame && !hasReflection && hasValidRatio; // Remove sharpness check
+      const hasGoodSharpness = sharpnessData.variance >= 2000;
+      const isGood = (score > scoreThreshold) && !hasReflection && hasValidRatio && hasGoodSharpness;
 
-      // Colors - show red if ratio is invalid
+      // Colors - show status with color coding
       const colorStr = isGood ? 'rgb(0,255,0)' : 
-                      (!hasValidRatio ? 'rgb(255,0,255)' : // Magenta for bad ratio
-                      (inFrame ? 'rgb(255,165,0)' : 'rgb(255,0,0)'));
+                      (!hasValidRatio ? 'rgb(255,0,255)' : 
+                      (!hasGoodSharpness ? 'rgb(255,165,0)' : 'rgb(255,0,0)'));
       outCtx.fillStyle = colorStr;
       outCtx.font = '18px sans-serif';
       outCtx.fillText(`Score: ${score.toFixed(2)}`, 10, 30);
-      // Remove sharpness display
-      outCtx.fillStyle = (inFrame ? 'rgb(0,255,0)' : 'rgb(255,0,0)');
-      outCtx.font = '16px sans-serif';
-      outCtx.fillText(`In Frame: ${inFrame?'YES':'NO'}`, 10, 60);
+      
+      // Sharpness display
+      outCtx.fillStyle = (hasGoodSharpness ? 'rgb(0,255,0)' : 'rgb(255,165,0)');
+      outCtx.fillText(`Sharpness: ${sharpnessData.variance.toFixed(0)} (${sharpnessData.quality})`, 10, 60);
+      
+      // Reflection display
       outCtx.fillStyle = (hasReflection ? 'rgb(255,0,0)' : 'rgb(0,255,0)');
       outCtx.fillText(`Reflection: ${(reflectionData.reflectionRatio*100).toFixed(1)}%`, 10, 90);
       
@@ -895,16 +867,19 @@ async function processVideo(){
       outCtx.fillText(`Expected: ${CARD_RATIO.toFixed(2)} ±${RATIO_TOLERANCE.toFixed(2)}`, 10, 150);
 
       if (isGood) {
-        // Calculate quality score for comparison - remove sharpness parameter
-        const qualityScore = calculateQualityScore(score, reflectionData.reflectionRatio);
+        // Calculate quality score with all factors
+        const qualityScore = calculateQualityScore(score, reflectionData.reflectionRatio, sharpnessData.normalized);
         
-        // Store frame with quality score (ensure we have a Mat)
+        // Store frame with all quality metrics (ensure we have a Mat)
         if (!srcMatForThisFrame) srcMatForThisFrame = cv.imread(reusableTempCanvas);
         frameHistory.push({
           frame: srcMatForThisFrame.clone(),
           contour: bestLocalContour.clone(),
           score: score,
-          qualityScore: qualityScore
+          qualityScore: qualityScore,
+          sharpness: sharpnessData.variance,
+          sharpnessNormalized: sharpnessData.normalized,
+          reflectionRatio: reflectionData.reflectionRatio
         });
         
         if (frameHistory.length > historySize) {
@@ -938,7 +913,9 @@ async function processVideo(){
           }
           
           console.log('Selected frame - Quality:', bestFrameData.qualityScore.toFixed(3), 
-                     'Score:', bestFrameData.score.toFixed(3));
+                     'Score:', bestFrameData.score.toFixed(3),
+                     'Sharpness:', bestFrameData.sharpness.toFixed(0),
+                     'Reflection:', (bestFrameData.reflectionRatio * 100).toFixed(1) + '%');
           
           if (capturedFrame) capturedFrame.delete();
           capturedFrame = bestFrameData.frame.clone();
@@ -979,10 +956,10 @@ async function processVideo(){
         
         if (toggleBlurWarn.checked) {
           outCtx.fillStyle = 'rgb(255,0,0)';
-          if (!inFrame) outCtx.fillText('Move card INTO the frame', 10, 240);
           if (hasReflection) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Light reflection detected - adjust angle', 10, 270); }
           if (score <= scoreThreshold) { outCtx.fillStyle = 'rgb(0,0,255)'; outCtx.fillText('Position card better in frame', 10, 300); }
           if (!hasValidRatio) { outCtx.fillStyle = 'rgb(255,0,255)'; outCtx.fillText('Card shape not recognized - adjust angle', 10, 330); }
+          if (!hasGoodSharpness) { outCtx.fillStyle = 'rgb(255,165,0)'; outCtx.fillText('Image blurry - hold device steady', 10, 360); }
         }
       }
 
@@ -1008,12 +985,11 @@ async function processVideo(){
     }
     
     const tD0 = performance.now();
-    // We already drew to outCtx; treat the overlay duration as draw time
     const tD1 = performance.now();
-    if (PROFILE) lastProfile.drawMs = tD1 - tD0;
     if (PROFILE) {
-      lastProfile.grabMs = tAfterGrab - tFrame0;
-      lastProfile.yoloMs = lastYoloMs || (tAfterYolo - tAfterGrab);
+      lastProfile.drawMs = tD1 - tD0;
+      lastProfile.grabMs = tAfterYolo - tFrame0;
+      lastProfile.yoloMs = lastYoloMs || 0;
       lastProfile.totalMs = (performance.now() - tFrame0);
       // Log occasionally to avoid spamming
       if ((window.__profTick = (window.__profTick||0)+1) % 30 === 0) {
@@ -1056,7 +1032,7 @@ async function processVideo(){
 toggleCameraBtn.addEventListener('click', () => {
   if (streaming) {
     stopCamera();
-    // ล้างประวัติเมื่อหยุด
+    // Clear frame history
     frameHistory.forEach(f => {
       f.frame.delete();
       f.contour.delete();
@@ -1076,54 +1052,42 @@ toggleCameraBtn.addEventListener('click', () => {
   }
 });
 
-// Crop button - extract card from captured frame
+// Crop and save the detected card
 saveBtn.addEventListener('click', ()=>{
   if (!capturedFrame || !bestContour) { 
     alert("No card detected yet. Please capture a card first."); 
     return; 
   }
   
-  // Extract the card region จากภาพต้นฉบับที่ไม่มีกรอบ (capturedFrame)
   if (bestCropped) bestCropped.delete();
   bestCropped = extractCardRegion(capturedFrame, bestContour);
   
-  // Show the cropped and sharpened card (ไม่มีกรอบเขียว)
   cv.imshow(canvasOutput, bestCropped);
   logStatus("Card cropped and sharpened! Downloading...");
   
-  // Auto-download - Create a temporary canvas for clean output
   setTimeout(() => {
-    // Create a temporary canvas to ensure clean output
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = bestCropped.cols;
     tempCanvas.height = bestCropped.rows;
-    const tempCtx = tempCanvas.getContext('2d');
     
-    // Draw the clean cropped image to temp canvas
     cv.imshow(tempCanvas, bestCropped);
     
-    // Download from temp canvas
     const link = document.createElement('a');
     link.download = 'cropped_card.png';
-    link.href = tempCanvas.toDataURL('image/png', 1.0); // คุณภาพสูงสุด
+    link.href = tempCanvas.toDataURL('image/png', 1.0);
     link.click();
     
     logStatus("Card saved! Click 'Start Camera' to capture another card.");
   }, 100);
 });                                                                              
 
-// cleanup when page unloads
+// Cleanup when page unloads
 window.addEventListener('unload', ()=>{
   stopCamera();
   try {
-    if (src) src.delete();
-    if (gray) gray.delete();
-    if (blurred) blurred.delete();
-    if (contours) contours.delete();
-    if (hierarchy) hierarchy.delete();
     if (bestContour) bestContour.delete();
     if (bestCropped) bestCropped.delete();
-    if (cap) cap.delete();
+    if (capturedFrame) capturedFrame.delete();
     if (yoloWorker) { yoloWorker.terminate(); yoloWorker = null; }
   } catch(e){}
 });
@@ -1138,7 +1102,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// New function to check aspect ratio of detected card
+// Check if detected box has valid card aspect ratio
 function isValidCardRatio(box) {
   const [x1, y1, x2, y2] = box;
   const width = Math.abs(x2 - x1);
@@ -1146,11 +1110,10 @@ function isValidCardRatio(box) {
   
   if (width === 0 || height === 0) return { isValid: false, ratio: 0, orientation: 'unknown' };
   
-  // Calculate both possible ratios (landscape and portrait)
-  const ratio1 = width / height;  // landscape
-  const ratio2 = height / width;  // portrait
+  const ratio1 = width / height;
+  const ratio2 = height / width;
   
-  // Check if either orientation matches card ratio within tolerance
+  // Check both landscape and portrait orientations
   const landscapeMatch = Math.abs(ratio1 - CARD_RATIO) <= RATIO_TOLERANCE;
   const portraitMatch = Math.abs(ratio2 - CARD_RATIO) <= RATIO_TOLERANCE;
   
